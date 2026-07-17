@@ -1,0 +1,48 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Install Level Zero development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libze-dev libclang-dev
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --release
+      - name: Verify runtime dependencies
+        run: |
+          ldd target/release/xefer
+          test "$(ldd target/release/xefer | grep -Ev 'linux-vdso|libze_loader\\.so\\.1|libgcc_s\\.so\\.1|libc\\.so\\.6|ld-linux' | wc -l)" -eq 0
+      - name: Package portable binary
+        run: |
+          install -Dm755 target/release/xefer dist/xefer
+          tar -C dist -czf xefer-x86_64-linux-gnu.tar.gz xefer
+          sha256sum xefer-x86_64-linux-gnu.tar.gz > xefer-x86_64-linux-gnu.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xefer-x86_64-linux-gnu
+          path: |
+            xefer-x86_64-linux-gnu.tar.gz
+            xefer-x86_64-linux-gnu.tar.gz.sha256
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            xefer-x86_64-linux-gnu.tar.gz
+            xefer-x86_64-linux-gnu.tar.gz.sha256
