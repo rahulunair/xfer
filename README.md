@@ -8,40 +8,45 @@ the Level Zero API. It verifies every copy and clearly separates:
 - Level Zero peer-access permission;
 - PCIe attachment topology.
 
-## Quick Start
+## Install
 
-Build requirements: Rust 1.85+, Clang/libclang, Level Zero headers, and the
-Level Zero loader.
-
-```sh
-cargo build --release
-./target/release/xfer list
-```
-
-Get one sustained direct-copy row for every ordered GPU pair, using all
-copy-capable queues:
+Prebuilt releases support Linux x86_64 and require the Intel Level Zero runtime
+(`libze_loader.so.1`).
 
 ```sh
-./target/release/xfer bench --class d2d-direct --saturation --summary-only
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/rahulunair/xfer/master/install.sh | sh
 ```
 
-Pairs run sequentially.
+The binary is installed to `~/.local/bin/xfer`.
+
+## Use
+
+```sh
+xfer list
+xfer bench
+```
+
+`xfer bench` measures every ordered GPU pair sequentially using direct Level
+Zero copies, all copy-capable queues, a 2 GiB payload, 50 samples, and a
+1-second warm-up. `--saturation` is accepted as an explicit form of the default.
 
 ## Common Commands
 
 | Task | Command |
 | --- | --- |
 | Inspect GPUs, engines, peer access, and PCIe topology | `xfer list` |
-| Direct-copy ceiling for every GPU pair | `xfer bench --class d2d-direct --saturation --summary-only` |
-| Detailed result for one pair | `xfer bench --device 0 --peer-device 1 --class d2d-direct --saturation` |
-| Full transfer matrix, compact report | `xfer bench --summary-only` |
+| Direct-copy ceiling for every GPU pair | `xfer bench` |
+| Compact pairwise roofline report | `xfer bench --summary-only` |
+| Detailed result for one pair | `xfer bench --device 0 --peer-device 1` |
+| Full transfer matrix, compact report | `xfer bench --class all --summary-only` |
 | Stable machine-readable output | `xfer bench --format csv` |
 
-Run `xfer bench --help` for advanced filters.
+Run `xfer bench --help` for filters and output options.
 
 ## Example Result
 
-```text
+```console
+$ xfer bench
 System under test
   Host  Intel(R) Xeon(R) 676X
         1 socket, 32 cores, 64 threads
@@ -51,10 +56,16 @@ System under test
   dev1  Intel(R) Arc(TM) Pro B70 Graphics
         PCI 0000:64:00.0 | Gen5 x16 | 63 GB/s theoretical
         engines 0 compute+copy; 1 copy
+  dev2  Intel(R) Arc(TM) Pro B70 Graphics
+        PCI 0000:90:00.0 | Gen5 x16 | 63 GB/s theoretical
+        engines 0 compute+copy; 1 copy
+  dev3  Intel(R) Arc(TM) Pro B70 Graphics
+        PCI 0000:a6:00.0 | Gen5 x16 | 63 GB/s theoretical
+        engines 0 compute+copy; 1 copy
 
 D2D direct dev0 -> dev1
   Transfer
-    payload             256 MiB
+    payload             2 GiB
     mode                saturation across 2 queues; payload partitioned across queues
     queues              engine 0 / queue 0 (compute+copy); engine 1 / queue 0 (copy)
     memory              device memory
@@ -67,26 +78,26 @@ D2D direct dev0 -> dev1
     host staging        none requested by xfer
 
                 lower        median       upper
-  time        [ 13.779 ms    13.782 ms    13.783 ms   ]
-  throughput  [ 19.475 GB/s  19.477 GB/s  19.482 GB/s ]
+  time        [ 48.641 ms    48.646 ms    48.651 ms   ]
+  throughput  [ 44.14 GB/s   44.145 GB/s  44.149 GB/s ]
                 95% bootstrap confidence interval (10000 resamples)
-  sample       p5 19.46 GB/s, p95 26.48 GB/s
+  sample       p5 44.1 GB/s, p95 44.17 GB/s
   variability  MAD 0.01 GB/s
-  outliers     9/50 (1 mild, 8 severe)
+  outliers     4/50 (2 mild, 2 severe)
 
   distribution  GB/s (50 samples)
-    19.4 | ########################  median
-    20.2 |
-    21.0 |
-    21.8 | #
-    22.6 |
-    23.3 |
-    24.1 |
-    24.9 |
-    25.7 | ##
-    26.5 | ##
-    27.2 |
-    28.0 | #
+    44.03 │ █                         1
+    44.05 │                           0
+    44.07 │ █                         1
+    44.09 │ ███                       3
+    44.11 │ ████████████             12
+    44.14 │ ████████████████████████ 24  ◆ median
+    44.16 │ ████████                  8
+    44.18 │                           0
+    44.20 │                           0
+    44.23 │                           0
+    44.25 │                           0
+    44.27 │ █                         1
 ```
 
 Use the median as the sustained pairwise bandwidth input. Short bursts in the
@@ -109,9 +120,13 @@ Rates use decimal GB/s. Wall-clock timing is the default.
 See [HOW_IT_WORKS.md](HOW_IT_WORKS.md) for measurement boundaries, statistics,
 saturation semantics, and comparison notes.
 
-## Validate
+## Build
+
+Building requires Rust 1.85+, Clang/libclang, Level Zero headers, and the Level
+Zero loader.
 
 ```sh
+cargo build --release
 cargo fmt --all -- --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings

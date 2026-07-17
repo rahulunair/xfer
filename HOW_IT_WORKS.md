@@ -23,12 +23,13 @@ is copied to host memory when necessary and compared byte-for-byte with the
 source pattern. A wrong copy fails the case instead of producing a bandwidth
 number.
 
-## Single-transfer mode
+## Single-queue mode
 
-`xfer bench` creates one command queue at queue index 0 for each selected Level
-Zero engine group. Human output calls this an `engine`; the Level Zero API
-calls it a command queue group. One sample records one copy, submits it,
-synchronizes its queue, verifies the result, and retains the elapsed duration.
+`xfer bench --single` creates one command queue at queue index 0 for each
+selected Level Zero engine group. Human output calls this an `engine`; the
+Level Zero API calls it a command queue group. One sample records one copy,
+submits it, synchronizes its queue, verifies the result, and retains the
+elapsed duration.
 
 The transfer classes are:
 
@@ -45,9 +46,9 @@ the host staging buffer.
 
 ## Saturation mode
 
-`xfer bench --saturation` or `xfer bench -s` asks a different question: what
-aggregate bandwidth is observed when the available copy-capable queues are kept
-busy together?
+Saturation is the default. `xfer bench --saturation` or `xfer bench -s` states
+it explicitly: what aggregate bandwidth is observed when the available
+copy-capable queues are kept busy together?
 
 Without `--engine`, saturation mode selects every queue index in every group
 that advertises Level Zero copy capability. With `--engine N`, it selects every
@@ -56,8 +57,8 @@ physical copy engine. `--queue-group` remains a compatibility alias.
 
 `--size` remains one total logical payload per sample. The payload is divided
 into balanced, non-overlapping regions, one per selected queue stream. For
-example, 256 MiB across four streams transfers approximately 64 MiB per stream,
-not 1 GiB total. The requested size must be at least the stream count so every
+example, the default 2 GiB across four streams transfers 512 MiB per stream,
+not 8 GiB total. The requested size must be at least the stream count so every
 region is non-empty.
 
 Each saturation sample follows this order:

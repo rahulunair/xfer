@@ -11,7 +11,7 @@ pub const VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     None => "0.0.0-dev",
 };
 
-pub const DEFAULT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_SAMPLES: u32 = 50;
 pub const MIN_SAMPLES: u32 = 10;
 pub const DEFAULT_WARMUP: Duration = Duration::from_secs(1);
@@ -53,7 +53,7 @@ impl Default for BenchOptions {
         Self {
             device: None,
             peer_device: None,
-            transfer_class: None,
+            transfer_class: Some(TransferClass::D2DDirect),
             queue_ordinal: None,
             size_bytes: DEFAULT_SIZE_BYTES,
             samples: DEFAULT_SAMPLES,
@@ -62,7 +62,7 @@ impl Default for BenchOptions {
             format: OutputFormat::Text,
             histogram: true,
             summary_only: false,
-            mode: BenchMode::Single,
+            mode: BenchMode::Saturation,
         }
     }
 }
@@ -253,6 +253,7 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
         options: BenchOptions::default(),
         explicit_device_timestamps: false,
         explicit_timing: None,
+        explicit_mode: None,
     };
     let mut index = 0;
 
@@ -267,7 +268,7 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
             return Ok(CliAction::Version);
         }
         if arg == "-s" {
-            state.options.mode = BenchMode::Saturation;
+            set_bench_mode(&mut state, BenchMode::Saturation)?;
             index += 1;
             continue;
         }
@@ -283,6 +284,7 @@ struct BenchParseState {
     options: BenchOptions,
     explicit_device_timestamps: bool,
     explicit_timing: Option<TimingMode>,
+    explicit_mode: Option<BenchMode>,
 }
 
 fn apply_bench_option(
@@ -303,7 +305,7 @@ fn apply_bench_option(
         }
         "--class" | "--transfer-class" => {
             let value = take_option_value(args, index, name, value)?;
-            state.options.transfer_class = Some(parse_transfer_class(&value)?);
+            state.options.transfer_class = parse_transfer_class(&value)?;
         }
         "--queue-group" | "--engine" | "--queue" | "--queue-ordinal" => {
             let value = take_option_value(args, index, name, value)?;
@@ -343,7 +345,11 @@ fn apply_bench_option(
         }
         "--saturation" => {
             reject_option_value(name, value)?;
-            state.options.mode = BenchMode::Saturation;
+            set_bench_mode(state, BenchMode::Saturation)?;
+        }
+        "--single" => {
+            reject_option_value(name, value)?;
+            set_bench_mode(state, BenchMode::Single)?;
         }
         _ => {
             return Err(CliError::new(format!(
@@ -380,6 +386,20 @@ fn finalize_bench_options(mut state: BenchParseState) -> Result<BenchOptions, Cl
     }
 
     Ok(state.options)
+}
+
+fn set_bench_mode(state: &mut BenchParseState, mode: BenchMode) -> Result<(), CliError> {
+    if state
+        .explicit_mode
+        .is_some_and(|explicit_mode| explicit_mode != mode)
+    {
+        return Err(CliError::new(
+            "--single conflicts with '--saturation' and '-s'",
+        ));
+    }
+    state.explicit_mode = Some(mode);
+    state.options.mode = mode;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -481,15 +501,16 @@ fn parse_sample_count(value: &str, option: &str) -> Result<u32, CliError> {
     }
 }
 
-fn parse_transfer_class(value: &str) -> Result<TransferClass, CliError> {
+fn parse_transfer_class(value: &str) -> Result<Option<TransferClass>, CliError> {
     match normalize_value(value).as_str() {
-        "h2d" | "host-to-device" => Ok(TransferClass::H2D),
-        "d2h" | "device-to-host" => Ok(TransferClass::D2H),
-        "d2d-same-device" | "same-device" | "same" => Ok(TransferClass::D2DSameDevice),
-        "d2d-direct" | "direct" => Ok(TransferClass::D2DDirect),
-        "d2d-staged" | "explicit-staged" | "staged" => Ok(TransferClass::D2DStaged),
+        "all" => Ok(None),
+        "h2d" | "host-to-device" => Ok(Some(TransferClass::H2D)),
+        "d2h" | "device-to-host" => Ok(Some(TransferClass::D2H)),
+        "d2d-same-device" | "same-device" | "same" => Ok(Some(TransferClass::D2DSameDevice)),
+        "d2d-direct" | "direct" => Ok(Some(TransferClass::D2DDirect)),
+        "d2d-staged" | "explicit-staged" | "staged" => Ok(Some(TransferClass::D2DStaged)),
         _ => Err(CliError::new(format!(
-            "invalid transfer class '{value}'; expected h2d, d2h, d2d-same-device, d2d-direct, or d2d-staged"
+            "invalid transfer class '{value}'; expected all, h2d, d2h, d2d-same-device, d2d-direct, or d2d-staged"
         ))),
     }
 }
@@ -596,12 +617,12 @@ Usage:
 
 Commands:
   list    Show GPUs, copy engines, peer access, and PCIe routes
-  bench   Measure the default transfer matrix
+  bench   Measure sustained direct GPU-to-GPU bandwidth
 
 Common examples:
   xfer bench
   xfer bench --summary-only
-  xfer bench --class d2d-direct --summary-only
+  xfer bench --device 0 --peer-device 1
 
 Options:
   -h, --help       Print help
@@ -624,21 +645,22 @@ const BENCH_HELP: &str = "\
 Usage:
   xfer bench [OPTIONS]
 
-With no options, xfer benchmarks the useful transfer matrix on every available
-GPU and engine. Use --summary-only for a compact report.
+With no options, xfer measures direct GPU-to-GPU saturation bandwidth for every
+ordered device pair. Defaults: all copy queues, 2 GiB, 50 samples, 1 s warm-up.
 
 Common options:
       --summary-only              Print only the final report
       --format FORMAT             text or csv; default text
       --no-histogram              Omit per-test histograms
-  -s, --saturation               Use all selected copy queues concurrently
+  -s, --saturation               Use all selected copy queues; default
 
 Advanced filters:
       --device N                  Select source/local device index
       --peer-device N             Select peer device index for cross-device cases
-      --class CLASS               h2d, d2h, d2d-same-device, d2d-direct, d2d-staged
+      --class CLASS               direct, staged, same, h2d, d2h, or all
       --engine ID                 Select the engine shown by 'xfer list'
-      --size BYTES                Allocation size, e.g. 268435456, 256MiB, 1GB
+      --single                    Use one queue per selected engine
+      --size BYTES                Payload size, e.g. 2GiB, 2048MiB; default 2GiB
       --samples N                 Sample count, minimum 10; default 50
       --warmup DURATION           Warm-up duration, e.g. 500ms, 1s; default 1s
       --timing MODE               wall-clock or device-timestamps
@@ -685,10 +707,16 @@ mod tests {
 
     #[test]
     fn bench_defaults_are_self_contained() {
-        assert_eq!(
-            parse_ok(&["bench"]),
-            CliAction::Command(Command::Bench(BenchOptions::default()))
-        );
+        let CliAction::Command(Command::Bench(options)) = parse_ok(&["bench"]) else {
+            panic!("expected bench command");
+        };
+
+        assert_eq!(options, BenchOptions::default());
+        assert_eq!(options.transfer_class, Some(TransferClass::D2DDirect));
+        assert_eq!(options.mode, BenchMode::Saturation);
+        assert_eq!(options.size_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(options.samples, 50);
+        assert_eq!(options.warmup, Duration::from_secs(1));
     }
 
     #[test]
@@ -708,6 +736,7 @@ mod tests {
             "96",
             "--warmup",
             "500ms",
+            "--single",
             "--device-timestamps",
             "--format",
             "csv",
@@ -735,7 +764,7 @@ mod tests {
 
     #[test]
     fn timing_option_and_alias_agree() {
-        let action = parse_ok(&["bench", "--timing", "device-timestamps"]);
+        let action = parse_ok(&["bench", "--single", "--timing", "device-timestamps"]);
         let CliAction::Command(Command::Bench(options)) = action else {
             panic!("expected bench command");
         };
@@ -749,6 +778,11 @@ mod tests {
 
     #[test]
     fn saturation_aliases_and_timing_conflict_are_explicit() {
+        let CliAction::Command(Command::Bench(defaults)) = parse_ok(&["bench"]) else {
+            panic!("expected bench command");
+        };
+        assert_eq!(defaults.mode, BenchMode::Saturation);
+
         for flag in ["-s", "--saturation"] {
             let CliAction::Command(Command::Bench(options)) = parse_ok(&["bench", flag]) else {
                 panic!("expected bench command");
@@ -756,10 +790,27 @@ mod tests {
             assert_eq!(options.mode, BenchMode::Saturation);
         }
 
+        let CliAction::Command(Command::Bench(single)) = parse_ok(&["bench", "--single"]) else {
+            panic!("expected bench command");
+        };
+        assert_eq!(single.mode, BenchMode::Single);
+
+        assert!(parse_err(&["bench", "--single", "--saturation"]).contains("conflicts"));
+        assert!(parse_err(&["bench", "-s", "--single"]).contains("conflicts"));
         assert!(
-            parse_err(&["bench", "--saturation", "--device-timestamps"])
+            parse_err(&["bench", "--device-timestamps"])
                 .contains("supports wall-clock timing only")
         );
+    }
+
+    #[test]
+    fn class_all_selects_the_full_transfer_matrix() {
+        let CliAction::Command(Command::Bench(options)) = parse_ok(&["bench", "--class", "all"])
+        else {
+            panic!("expected bench command");
+        };
+
+        assert_eq!(options.transfer_class, None);
     }
 
     #[test]
@@ -807,6 +858,8 @@ mod tests {
         assert!(help(HelpTopic::Bench).contains("--device-timestamps"));
         assert!(help(HelpTopic::Bench).contains("--format FORMAT"));
         assert!(help(HelpTopic::Bench).contains("--summary-only"));
+        assert!(help(HelpTopic::Bench).contains("--single"));
+        assert!(help(HelpTopic::Bench).contains("default 2GiB"));
         assert!(version().starts_with("xfer "));
     }
 }
