@@ -26,7 +26,7 @@ pub fn render_list(report: &ListReport) -> String {
 
         for queue in &device.queue_groups {
             lines.push(format!(
-                "  engine {} ({}, {})",
+                "  queue group {} ({}, {})",
                 queue.ordinal,
                 render_queue_flags(queue.flags),
                 render_queue_count(queue.queue_count)
@@ -53,7 +53,7 @@ pub fn render_list(report: &ListReport) -> String {
         }
     }
 
-    finish_lines(lines)
+    finish_lines(&lines)
 }
 
 pub fn render_bench_text(report: &BenchReport, options: &TextOptions) -> String {
@@ -65,7 +65,7 @@ pub fn render_bench_text(report: &BenchReport, options: &TextOptions) -> String 
 
     if report.cases.is_empty() {
         lines.push("no benchmark cases selected".to_owned());
-        return finish_lines(lines);
+        return finish_lines(&lines);
     }
 
     for (case_index, case) in report.cases.iter().enumerate() {
@@ -79,25 +79,25 @@ pub fn render_bench_text(report: &BenchReport, options: &TextOptions) -> String 
         lines.extend(render_summary_lines(&report.cases, options.color));
     }
 
-    finish_lines(lines)
+    finish_lines(&lines)
 }
 
 pub fn render_bench_summary(report: &BenchReport, options: &TextOptions) -> String {
     let mut lines = render_system_lines(&report.system, options.color);
     lines.extend(render_summary_lines(&report.cases, options.color));
-    finish_lines(lines)
+    finish_lines(&lines)
 }
 
 pub(crate) fn render_summary_text(cases: &[BenchCase], options: &TextOptions) -> String {
-    finish_lines(render_summary_lines(cases, options.color))
+    finish_lines(&render_summary_lines(cases, options.color))
 }
 
 pub(crate) fn render_system_text(system: &SystemInfo, color: ColorMode) -> String {
-    finish_lines(render_system_lines(system, color))
+    finish_lines(&render_system_lines(system, color))
 }
 
 pub fn render_case_text(case: &BenchCase, options: &TextOptions) -> String {
-    finish_lines(render_case_lines(case, options))
+    finish_lines(&render_case_lines(case, options))
 }
 
 fn render_system_lines(system: &SystemInfo, color: ColorMode) -> Vec<String> {
@@ -114,7 +114,10 @@ fn render_system_lines(system: &SystemInfo, color: ColorMode) -> Vec<String> {
             "        PCI {pci} | {}",
             render_system_link(&device.pcie_link)
         ));
-        lines.push(format!("        engines {}", render_system_engines(device)));
+        lines.push(format!(
+            "        queue groups {}",
+            render_system_queue_groups(device)
+        ));
     }
     lines.push(String::new());
     lines
@@ -160,7 +163,7 @@ fn render_system_link(link: &LinkInfo) -> String {
     }
 }
 
-fn render_system_engines(device: &super::model::DeviceInfo) -> String {
+fn render_system_queue_groups(device: &super::model::DeviceInfo) -> String {
     if device.queue_groups.is_empty() {
         return "none".to_owned();
     }
@@ -200,7 +203,7 @@ struct SummaryRow {
 const SUMMARY_HEADERS: [&str; 7] = [
     "transfer",
     "path",
-    "engine(s)",
+    "queue group(s)",
     "median GB/s",
     "p5..p95 GB/s",
     "MAD GB/s",
@@ -532,8 +535,8 @@ pub(crate) fn status_label_from_case_id(id: &str) -> String {
     let queue_scope = parts
         .next()
         .map(|part| match part.strip_prefix("group-") {
-            Some(id) => format!(" / engine {id}"),
-            None if part == "all-copy-groups" => " / all copy engines".to_owned(),
+            Some(id) => format!(" / queue group {id}"),
+            None if part == "all-copy-groups" => " / all copy queue groups".to_owned(),
             None => String::new(),
         })
         .unwrap_or_default();
@@ -991,7 +994,7 @@ fn render_streams(streams: &[QueueStreamInfo]) -> String {
         .iter()
         .map(|stream| {
             format!(
-                "engine {} / queue {} ({})",
+                "queue group {} / queue {} ({})",
                 stream.group_ordinal,
                 stream.queue_index,
                 render_queue_flags(stream.flags)
@@ -1165,10 +1168,9 @@ fn trim_decimal_zeros(value: &str) -> String {
 
 fn sanitize_human_text(value: &str) -> String {
     value
-        .replace("queue group ordinal ", "engine ")
-        .replace("queue-group ordinals", "engine IDs")
-        .replace("queue group ", "engine ")
-        .replace(" ordinal ", " engine ")
+        .replace("queue group ordinal ", "queue group ")
+        .replace("queue-group ordinals", "queue group IDs")
+        .replace(" ordinal ", " ID ")
 }
 
 fn plural<'word>(count: usize, singular: &'word str, plural: &'word str) -> &'word str {
@@ -1182,7 +1184,7 @@ fn paint(color: ColorMode, code: &str, text: &str) -> String {
     }
 }
 
-fn finish_lines(lines: Vec<String>) -> String {
+fn finish_lines(lines: &[String]) -> String {
     let mut output = lines.join("\n");
     output.push('\n');
     output
@@ -1267,7 +1269,7 @@ mod tests {
         assert!(output.contains("D2H dev0 -> pinned host"));
         assert!(output.contains("Transfer"));
         assert!(output.contains("payload             256 MiB"));
-        assert!(output.contains("queues              engine 1 / queue 0 (copy)"));
+        assert!(output.contains("queues              queue group 1 / queue 0 (copy)"));
         assert!(output.contains("timing              wall clock, 5 samples, 1 s warm-up"));
         assert!(output.contains("Copy path"));
         assert!(output.contains("time"));
@@ -1545,19 +1547,19 @@ mod tests {
 
         let text = render_bench_text(&report, &TextOptions::default());
         assert!(text.contains("D2D direct dev0 -> dev1"));
-        assert!(text.contains("engine 0 / queue 0 (compute+copy)"));
+        assert!(text.contains("queue group 0 / queue 0 (compute+copy)"));
         assert!(text.contains("direct GPU-memory copy (Level Zero)"));
         assert!(text.contains("not supported (zeDeviceCanAccessPeer = no)"));
         assert!(text.contains("different root ports"));
         assert!(text.contains("host staging        none requested by xfer"));
         assert!(!text.contains("physical P2P"));
         assert!(!text.contains("verification        "));
-        assert!(text.contains("engine 0 does not advertise copy capability"));
+        assert!(text.contains("queue group 0 does not advertise copy capability"));
         assert!(!text.contains("ordinal"));
     }
 
     #[test]
-    fn renders_list_text_with_plain_engine_names() {
+    fn renders_list_text_with_queue_group_names() {
         let report = ListReport {
             devices: vec![DeviceInfo {
                 index: 0,
@@ -1589,18 +1591,18 @@ mod tests {
 
         let text = render_list(&report);
         assert!(text.contains("dev0  Intel GPU"));
-        assert!(text.contains("engine 1 (copy, 1 queue)"));
+        assert!(text.contains("queue group 1 (copy, 1 queue)"));
         assert!(text.contains("dev0 -> dev1  yes"));
         assert!(!text.contains("ordinal"));
     }
 
     #[test]
-    fn status_label_is_compact_and_avoids_queue_terms() {
+    fn status_label_uses_queue_group_term() {
         assert_eq!(
             status_label_from_case_id(
                 "d2d-direct/dev0-to-dev1/256MiB/group-2/wall-clock/single-streams-1"
             ),
-            "D2D direct dev0 -> dev1 / engine 2"
+            "D2D direct dev0 -> dev1 / queue group 2"
         );
     }
 }

@@ -26,10 +26,9 @@ number.
 ## Single-queue mode
 
 `xfer bench --single` creates one command queue at queue index 0 for each
-selected Level Zero engine group. Human output calls this an `engine`; the
-Level Zero API calls it a command queue group. One sample records one copy,
-submits it, synchronizes its queue, verifies the result, and retains the
-elapsed duration.
+selected Level Zero command queue group. One sample records one copy, submits
+it, synchronizes its queue, verifies the result, and retains the elapsed
+duration.
 
 The transfer classes are:
 
@@ -50,10 +49,10 @@ Saturation is the default. `xfer bench --saturation` or `xfer bench -s` states
 it explicitly: what aggregate bandwidth is observed when the available
 copy-capable queues are kept busy together?
 
-Without `--engine`, saturation mode selects every queue index in every group
-that advertises Level Zero copy capability. With `--engine N`, it selects every
-queue index in that group. It does not claim that a queue is a distinct
-physical copy engine. `--queue-group` remains a compatibility alias.
+Without `--queue-group`, saturation mode selects every queue index in every
+group that advertises Level Zero copy capability. With `--queue-group N`, it
+selects every queue index in that group. It does not claim that a queue is a
+distinct physical copy engine.
 
 `--size` remains one total logical payload per sample. The payload is divided
 into balanced, non-overlapping regions, one per selected queue stream. For
@@ -82,9 +81,9 @@ are shown in text and CSV output.
 
 Saturation supports wall-clock timing only. Independent queues do not provide
 one Level Zero device-timestamp interval that represents the aggregate
-operation, so `--saturation --device-timestamps` is rejected.
+operation, so `--saturation --timing device-timestamps` is rejected.
 
-## Engine identity
+## Queue group identity
 
 Level Zero exposes command queue groups. Each group has:
 
@@ -92,11 +91,12 @@ Level Zero exposes command queue groups. Each group has:
 - capability flags such as copy and compute;
 - a count of queue indices that can be created in that group.
 
-Human output calls the group ID an engine ID and prints queue indices in words,
-for example `engine 1 / queue 2`. CSV retains API-oriented field names for
-compatibility. These identifiers describe API topology, not proof of a
-specific blitter or other physical engine. `xfer` never silently changes a
-requested engine.
+Human output prints the API object directly, for example
+`queue group 1 / queue 2`. Queue numbering starts again inside each group, so
+`queue group 0 / queue 0` and `queue group 1 / queue 0` are distinct queues.
+CSV uses compact machine-readable field names. These identifiers describe API
+topology, not proof of a specific blitter or other physical engine. `xfer`
+never silently changes a requested queue group.
 
 ## Warm-up and samples
 
@@ -175,10 +175,10 @@ ports, different host bridges, and unknown topology. This attachment
 classification is not physical transfer-path proof and does not identify an
 upstream bridge as a PCIe switch without stronger evidence.
 
-Destination poisoning and verification use a destination copy-capable engine
-selected independently from the measured source engine. These operations are
-outside the timed interval. A direct case therefore is not rejected merely
-because source and destination engine IDs differ.
+Destination poisoning and verification use a destination copy-capable queue
+group selected independently from the measured source queue group. These
+operations are outside the timed interval. A direct case therefore is not
+rejected merely because source and destination queue group IDs differ.
 
 `explicit-staged` has a narrower meaning: `xfer` itself issued D2H and H2D legs
 through pinned host memory with an explicit barrier between them.
@@ -189,8 +189,8 @@ Intel's `ze_peer` is useful reference code, but an equivalent comparison
 requires matching the operation rather than comparing two labels.
 
 The local Level Zero Tests implementation inspected for this design enumerates
-every `(queue-group ordinal, queue index)` pair and presents a flattened
-`-u` engine number. Its default flattened index 0 maps to group 0, queue 0.
+every `(queue-group ID, queue index)` pair and presents a flattened `-u`
+"engine" number. Its default flattened index 0 maps to group 0, queue 0.
 Its `--parallel_single_target` path divides one total buffer among selected
 flattened queue entries, submits the selected command lists, then synchronizes
 them. That payload interpretation aligns with `xfer --saturation`.
@@ -215,7 +215,7 @@ Before comparing numbers, match all of the following:
 
 1. Source and destination devices and transfer direction.
 2. Total logical byte count.
-3. Queue-group ordinal and queue index, translating `ze_peer -u` correctly.
+3. Queue group ID and queue index, translating `ze_peer -u` correctly.
 4. Number of concurrent streams.
 5. Regular versus immediate command-list mode.
 6. Unidirectional versus bidirectional traffic accounting.

@@ -61,9 +61,7 @@ impl Histogram {
                 } else {
                     lower + index as f64 * bin_width
                 };
-                let bin_upper = if lower == upper {
-                    upper
-                } else if index + 1 == bin_count {
+                let bin_upper = if lower == upper || index + 1 == bin_count {
                     upper
                 } else {
                     lower + (index + 1) as f64 * bin_width
@@ -201,7 +199,7 @@ fn scaled_bar_len(count: usize, max_count: usize, max_bar_width: usize) -> usize
     if count == 0 || max_count == 0 {
         0
     } else {
-        ((count * max_bar_width) + max_count - 1) / max_count
+        (count * max_bar_width).div_ceil(max_count)
     }
 }
 

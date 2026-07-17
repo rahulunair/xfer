@@ -34,10 +34,12 @@ Zero copies, all copy-capable queues, a 2 GiB payload, 50 samples, and a
 
 | Task | Command |
 | --- | --- |
-| Inspect GPUs, engines, peer access, and PCIe topology | `xfer list` |
+| Inspect GPUs, queue groups, peer access, and PCIe topology | `xfer list` |
 | Direct-copy ceiling for every GPU pair | `xfer bench` |
 | Compact pairwise roofline report | `xfer bench --summary-only` |
 | Detailed result for one pair | `xfer bench --device 0 --peer-device 1` |
+| Compare queue groups separately | `xfer bench --single --summary-only` |
+| Measure explicit host staging | `xfer bench --class staged --summary-only` |
 | Full transfer matrix, compact report | `xfer bench --class all --summary-only` |
 | Stable machine-readable output | `xfer bench --format csv` |
 
@@ -52,22 +54,22 @@ System under test
         1 socket, 32 cores, 64 threads
   dev0  Intel(R) Arc(TM) Pro B70 Graphics
         PCI 0000:0d:00.0 | Gen5 x16 | 63 GB/s theoretical
-        engines 0 compute+copy; 1 copy
+        queue groups 0 compute+copy; 1 copy
   dev1  Intel(R) Arc(TM) Pro B70 Graphics
         PCI 0000:64:00.0 | Gen5 x16 | 63 GB/s theoretical
-        engines 0 compute+copy; 1 copy
+        queue groups 0 compute+copy; 1 copy
   dev2  Intel(R) Arc(TM) Pro B70 Graphics
         PCI 0000:90:00.0 | Gen5 x16 | 63 GB/s theoretical
-        engines 0 compute+copy; 1 copy
+        queue groups 0 compute+copy; 1 copy
   dev3  Intel(R) Arc(TM) Pro B70 Graphics
         PCI 0000:a6:00.0 | Gen5 x16 | 63 GB/s theoretical
-        engines 0 compute+copy; 1 copy
+        queue groups 0 compute+copy; 1 copy
 
 D2D direct dev0 -> dev1
   Transfer
     payload             2 GiB
     mode                saturation across 2 queues; payload partitioned across queues
-    queues              engine 0 / queue 0 (compute+copy); engine 1 / queue 0 (copy)
+    queues              queue group 0 / queue 0 (compute+copy); queue group 1 / queue 0 (copy)
     memory              device memory
     timing              wall clock, 50 samples, 1 s warm-up
 
@@ -111,6 +113,9 @@ upper tail are not a stable roofline.
   pinned host memory. It reports logical payload rate and 2x copy traffic.
 - `peer access: supported` is the Level Zero P2P capability result. It does not
   prove the physical DMA route.
+- A queue group is a Level Zero capability group, not proof of a distinct
+  physical engine. `compute+copy` means the group accepts both command types;
+  this benchmark submits only copy commands.
 - PCIe topology labels come from endpoint ancestry in sysfs.
 - Pair tests are isolated directional ceilings, not concurrent tensor-parallel
   collective benchmarks.

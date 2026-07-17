@@ -532,9 +532,9 @@ mod tests {
         assert!(stdout.starts_with("System under test\n"));
         assert_eq!(stdout.matches("System under test").count(), 1);
         assert!(stdout.contains("H2D pinned host -> dev0"));
-        assert!(stdout.contains("engine 2 / queue 0 (copy)"));
+        assert!(stdout.contains("queue group 2 / queue 0 (copy)"));
         assert!(stderr.contains("\r\u{1b}[2KTopology planned"));
-        assert!(stderr.contains("\r\u{1b}[2KBenchmarking H2D host -> dev0 / engine 2"));
+        assert!(stderr.contains("\r\u{1b}[2KBenchmarking H2D host -> dev0 / queue group 2"));
         assert!(stderr.ends_with("\r\u{1b}[2K"));
         assert!(!stderr.contains("ordinal"));
     }
@@ -593,7 +593,7 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         assert_eq!(
             stderr,
-            "Topology planned: 1 device, 1 case\nBenchmarking H2D host -> dev0 / engine 2 (1/1)\nBenchmarking H2D host -> dev0 / engine 2: Warming up for 10 ms\nBenchmarking H2D host -> dev0 / engine 2: Collecting 3 samples in estimated 30 ms\nBenchmarking H2D host -> dev0 / engine 2: Analyzing\nComplete: 1 case, 1 measured, 0 skipped\n"
+            "Topology planned: 1 device, 1 case\nBenchmarking H2D host -> dev0 / queue group 2 (1/1)\nBenchmarking H2D host -> dev0 / queue group 2: Warming up for 10 ms\nBenchmarking H2D host -> dev0 / queue group 2: Collecting 3 samples in estimated 30 ms\nBenchmarking H2D host -> dev0 / queue group 2: Analyzing\nComplete: 1 case, 1 measured, 0 skipped\n"
         );
     }
 
@@ -621,7 +621,7 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         assert_eq!(
             stderr,
-            "\r\u{1b}[2KBenchmarking H2D host -> dev0 / engine 2: Collecting [==========          ] 25/50 samples"
+            "\r\u{1b}[2KBenchmarking H2D host -> dev0 / queue group 2: Collecting [==========          ] 25/50 samples"
         );
     }
 

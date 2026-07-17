@@ -214,7 +214,7 @@ pub fn read_peer_route_from_sysfs(
 }
 
 pub fn parse_link_speed(text: &str) -> Option<LinkSpeed> {
-    let mut fields = text.trim().split_whitespace();
+    let mut fields = text.split_whitespace();
     let value = fields.next()?;
     let units = fields.next()?;
 

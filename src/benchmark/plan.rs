@@ -174,12 +174,12 @@ fn queue_selections(device: &DeviceRecord, options: &BenchOptions) -> Vec<QueueS
         .collect::<Vec<_>>();
     match options.mode {
         BenchMode::Single => {
-            queue_selections_from_groups(device.index, &groups, options.queue_ordinal)
+            queue_selections_from_groups(device.index, &groups, options.queue_group)
         }
         BenchMode::Saturation => vec![saturation_queue_selection(
             device.index,
             &groups,
-            options.queue_ordinal,
+            options.queue_group,
         )],
     }
 }
@@ -187,9 +187,9 @@ fn queue_selections(device: &DeviceRecord, options: &BenchOptions) -> Vec<QueueS
 fn queue_selections_from_groups(
     device_index: u32,
     queues: &[QueueGroupInfo],
-    queue_ordinal: Option<u32>,
+    queue_group: Option<u32>,
 ) -> Vec<QueueSelection> {
-    if let Some(group_ordinal) = queue_ordinal {
+    if let Some(group_ordinal) = queue_group {
         return match queues.iter().find(|queue| queue.ordinal == group_ordinal) {
             Some(queue) => vec![QueueSelection {
                 selected_group: Some(queue.clone()),
@@ -235,9 +235,9 @@ fn queue_selections_from_groups(
 fn saturation_queue_selection(
     device_index: u32,
     queues: &[QueueGroupInfo],
-    queue_ordinal: Option<u32>,
+    queue_group: Option<u32>,
 ) -> QueueSelection {
-    if let Some(group_ordinal) = queue_ordinal {
+    if let Some(group_ordinal) = queue_group {
         return queue_selections_from_groups(device_index, queues, Some(group_ordinal))
             .into_iter()
             .next()
@@ -597,7 +597,7 @@ fn destination_phase_selection(
                 .iter()
                 .map(|queue| queue.info.clone())
                 .collect::<Vec<_>>(),
-            options.queue_ordinal,
+            options.queue_group,
         ),
     }
 }
@@ -637,7 +637,7 @@ fn destination_verification_stream(
     let stream = first_copy_stream(destination.queues.iter().map(|queue| &queue.info));
     if stream.is_none() {
         reasons.push(format!(
-            "destination dev{} has no copy-capable engine for verification",
+            "destination dev{} has no copy-capable queue group for verification",
             destination.index
         ));
     }
@@ -807,10 +807,10 @@ mod tests {
     }
 
     #[test]
-    fn verification_engine_does_not_need_to_match_measured_engine_id() {
+    fn verification_group_does_not_need_to_match_measured_group_id() {
         let destination_groups = [queue(7, false, true), queue(9, true, false)];
 
-        let selected = first_copy_stream(&destination_groups).expect("copy engine");
+        let selected = first_copy_stream(&destination_groups).expect("copy queue group");
 
         assert_eq!(selected.group_ordinal, 9);
         assert_eq!(selected.queue_index, 0);

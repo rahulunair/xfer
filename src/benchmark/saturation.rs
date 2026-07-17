@@ -614,7 +614,7 @@ fn verification_stream<'context>(
 ) -> std::result::Result<QueueStream<'context>, CaseExecutionError> {
     let selected = selected.ok_or_else(|| {
         CaseExecutionError::Skip(format!(
-            "dev{} has no copy-capable engine for verification",
+            "dev{} has no copy-capable queue group for verification",
             device.index
         ))
     })?;

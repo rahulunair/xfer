@@ -2,7 +2,7 @@ use super::model::{
     BenchCase, BenchReport, CaseOutcome, Endpoint, LinkInfo, Operation, PeerRoute, QueueStreamInfo,
 };
 
-pub const BENCH_CSV_HEADER: &str = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_ordinal,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason,benchmark_mode,stream_count,queue_streams,second_phase_stream_count,second_phase_queue_streams,logical_payload_bytes,submitted_copy_bytes,submission_policy,staging_barrier,peer_route_class,peer_route_detail,true_p2p_status,rate_basis,submitted_copy_median_gb_s,verification_queue_stream";
+pub const BENCH_CSV_HEADER: &str = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_group,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason,benchmark_mode,stream_count,queue_streams,second_phase_stream_count,second_phase_queue_streams,logical_payload_bytes,submitted_copy_bytes,submission_policy,staging_barrier,peer_route_class,peer_route_detail,rate_basis,submitted_copy_median_gb_s";
 
 pub fn render_bench_csv(report: &BenchReport) -> String {
     let mut lines = Vec::with_capacity(report.cases.len() + 1);
@@ -12,7 +12,7 @@ pub fn render_bench_csv(report: &BenchReport) -> String {
         lines.push(render_case_csv(case));
     }
 
-    finish_lines(lines)
+    finish_lines(&lines)
 }
 
 pub fn render_case_csv(case: &BenchCase) -> String {
@@ -86,16 +86,10 @@ pub fn render_case_csv(case: &BenchCase) -> String {
     fields.push(staging_barrier(case).to_owned());
     fields.push(render_peer_route_class(&case.operation).to_owned());
     fields.push(render_peer_route_detail(&case.operation));
-    fields.push(render_true_p2p_status(&case.operation).to_owned());
     fields.push(render_rate_basis(&case.operation).to_owned());
     fields.push(summary.map_or_else(String::new, |summary| {
         format_float(summary.median * f64::from(submitted_copy_multiplier(case)))
     }));
-    fields.push(
-        case.verification_stream
-            .as_ref()
-            .map_or_else(String::new, |stream| render_streams(&[*stream])),
-    );
 
     fields
         .into_iter()
@@ -213,16 +207,6 @@ fn render_peer_route_detail(operation: &Operation) -> String {
     }
 }
 
-fn render_true_p2p_status(operation: &Operation) -> &'static str {
-    match operation {
-        Operation::Direct { .. } => "not-measured",
-        Operation::ExplicitStaged { .. } => "no-host-staged",
-        Operation::HostToDevice | Operation::DeviceToHost | Operation::SameDevice => {
-            "not-applicable"
-        }
-    }
-}
-
 fn render_rate_basis(operation: &Operation) -> &'static str {
     if matches!(operation, Operation::ExplicitStaged { .. }) {
         "end-to-end-logical-payload"
@@ -261,7 +245,7 @@ fn format_float(value: f64) -> String {
     }
 }
 
-fn finish_lines(lines: Vec<String>) -> String {
+fn finish_lines(lines: &[String]) -> String {
     let mut output = lines.join("\n");
     output.push('\n');
     output
@@ -328,22 +312,21 @@ mod tests {
     #[test]
     fn csv_header_is_stable() {
         let columns = BENCH_CSV_HEADER.split(',').collect::<Vec<_>>();
-        let legacy = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_ordinal,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason"
+        let base_columns = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_group,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason"
             .split(',')
             .collect::<Vec<_>>();
 
-        assert_eq!(columns.len(), 43);
-        assert_eq!(&columns[..legacy.len()], legacy);
+        assert_eq!(columns.len(), 41);
+        assert_eq!(&columns[..base_columns.len()], base_columns);
         assert_eq!(columns[0], "status");
         assert_eq!(columns[1], "transfer_class");
-        assert_eq!(columns[9], "queue_ordinal");
+        assert_eq!(columns[9], "queue_group");
         assert_eq!(columns[27], "skip_reason");
         assert_eq!(columns[28], "benchmark_mode");
         assert_eq!(columns[36], "staging_barrier");
         assert_eq!(columns[37], "peer_route_class");
-        assert_eq!(columns[39], "true_p2p_status");
-        assert_eq!(columns[41], "submitted_copy_median_gb_s");
-        assert_eq!(columns[42], "verification_queue_stream");
+        assert_eq!(columns[39], "rate_basis");
+        assert_eq!(columns[40], "submitted_copy_median_gb_s");
     }
 
     #[test]
@@ -373,7 +356,7 @@ mod tests {
             split_csv_record(lines[0]).len(),
             split_csv_record(lines[1]).len()
         );
-        assert_eq!(split_csv_record(lines[0]).len(), 43);
+        assert_eq!(split_csv_record(lines[0]).len(), 41);
         assert!(lines[1].contains("\"unknown:bad, \"\"quoted\"\" path\""));
         assert!(!csv.contains("\u{1b}["));
     }
@@ -438,7 +421,7 @@ mod tests {
         assert!(csv.contains("peer access unsupported"));
         let fields = split_csv_record(csv.lines().nth(1).expect("data row"));
         assert_eq!(fields[37], "cross-host-bridge");
-        assert_eq!(fields[39], "not-measured");
+        assert_eq!(fields[39], "payload");
     }
 
     #[test]
@@ -490,10 +473,9 @@ mod tests {
         assert_eq!(fields[36], "after-d2h-all");
         assert_eq!(fields[37], "unknown");
         assert_eq!(fields[38], "test");
-        assert_eq!(fields[39], "no-host-staged");
-        assert_eq!(fields[40], "end-to-end-logical-payload");
+        assert_eq!(fields[39], "end-to-end-logical-payload");
         assert_eq!(
-            fields[41],
+            fields[40],
             format_float(match &case.outcome {
                 CaseOutcome::Measured { summary, .. } => summary.median * 2.0,
                 CaseOutcome::Skipped { .. } => 0.0,

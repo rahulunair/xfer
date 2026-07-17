@@ -385,7 +385,7 @@ fn measure_direct(
     )?;
     let verification_stream = plan.verification_stream.as_ref().ok_or_else(|| {
         CaseExecutionError::Skip(format!(
-            "destination dev{} has no copy-capable engine for verification",
+            "destination dev{} has no copy-capable queue group for verification",
             destination.index
         ))
     })?;

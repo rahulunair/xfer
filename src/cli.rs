@@ -37,7 +37,7 @@ pub struct BenchOptions {
     pub device: Option<u32>,
     pub peer_device: Option<u32>,
     pub transfer_class: Option<TransferClass>,
-    pub queue_ordinal: Option<u32>,
+    pub queue_group: Option<u32>,
     pub size_bytes: u64,
     pub samples: u32,
     pub warmup: Duration,
@@ -54,7 +54,7 @@ impl Default for BenchOptions {
             device: None,
             peer_device: None,
             transfer_class: Some(TransferClass::D2DDirect),
-            queue_ordinal: None,
+            queue_group: None,
             size_bytes: DEFAULT_SIZE_BYTES,
             samples: DEFAULT_SAMPLES,
             warmup: DEFAULT_WARMUP,
@@ -251,7 +251,6 @@ fn parse_list(args: &[String]) -> Result<CliAction, CliError> {
 fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
     let mut state = BenchParseState {
         options: BenchOptions::default(),
-        explicit_device_timestamps: false,
         explicit_timing: None,
         explicit_mode: None,
     };
@@ -282,7 +281,6 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
 
 struct BenchParseState {
     options: BenchOptions,
-    explicit_device_timestamps: bool,
     explicit_timing: Option<TimingMode>,
     explicit_mode: Option<BenchMode>,
 }
@@ -303,13 +301,13 @@ fn apply_bench_option(
             let value = take_option_value(args, index, name, value)?;
             state.options.peer_device = Some(parse_u32(&value, name)?);
         }
-        "--class" | "--transfer-class" => {
+        "--class" => {
             let value = take_option_value(args, index, name, value)?;
             state.options.transfer_class = parse_transfer_class(&value)?;
         }
-        "--queue-group" | "--engine" | "--queue" | "--queue-ordinal" => {
+        "--queue-group" => {
             let value = take_option_value(args, index, name, value)?;
-            state.options.queue_ordinal = Some(parse_u32(&value, name)?);
+            state.options.queue_group = Some(parse_u32(&value, name)?);
         }
         "--size" => {
             let value = take_option_value(args, index, name, value)?;
@@ -339,10 +337,6 @@ fn apply_bench_option(
             reject_option_value(name, value)?;
             state.options.summary_only = true;
         }
-        "--device-timestamps" => {
-            reject_option_value(name, value)?;
-            state.explicit_device_timestamps = true;
-        }
         "--saturation" => {
             reject_option_value(name, value)?;
             set_bench_mode(state, BenchMode::Saturation)?;
@@ -361,17 +355,7 @@ fn apply_bench_option(
 }
 
 fn finalize_bench_options(mut state: BenchParseState) -> Result<BenchOptions, CliError> {
-    if state.explicit_device_timestamps && state.explicit_timing == Some(TimingMode::WallClock) {
-        return Err(CliError::new(
-            "--device-timestamps conflicts with '--timing wall-clock'",
-        ));
-    }
-
-    state.options.timing = if state.explicit_device_timestamps {
-        TimingMode::DeviceTimestamps
-    } else {
-        state.explicit_timing.unwrap_or(TimingMode::WallClock)
-    };
+    state.options.timing = state.explicit_timing.unwrap_or(TimingMode::WallClock);
     if state.options.mode == BenchMode::Saturation
         && state.options.timing == TimingMode::DeviceTimestamps
     {
@@ -616,7 +600,7 @@ Usage:
   xfer --version
 
 Commands:
-  list    Show GPUs, copy engines, peer access, and PCIe routes
+  list    Show GPUs, queue groups, peer access, and PCIe routes
   bench   Measure sustained direct GPU-to-GPU bandwidth
 
 Common examples:
@@ -633,8 +617,8 @@ const LIST_HELP: &str = "\
 Usage:
   xfer list
 
-Show Level Zero GPUs, copy engines, device-to-device access, and negotiated
-PCIe links and routes.
+Show Level Zero GPUs, command queue groups, device-to-device access, and
+negotiated PCIe links and routes.
 
 Options:
   -h, --help       Print help
@@ -658,16 +642,12 @@ Advanced filters:
       --device N                  Select source/local device index
       --peer-device N             Select peer device index for cross-device cases
       --class CLASS               direct, staged, same, h2d, d2h, or all
-      --engine ID                 Select the engine shown by 'xfer list'
-      --single                    Use one queue per selected engine
+      --queue-group ID            Select the queue group shown by 'xfer list'
+      --single                    Test each selected queue group separately
       --size BYTES                Payload size, e.g. 2GiB, 2048MiB; default 2GiB
       --samples N                 Sample count, minimum 10; default 50
       --warmup DURATION           Warm-up duration, e.g. 500ms, 1s; default 1s
       --timing MODE               wall-clock or device-timestamps
-      --device-timestamps         Alias for --timing device-timestamps
-
-Compatibility aliases:
-      --transfer-class, --queue-group, --queue, --queue-ordinal
 
   -h, --help                      Print help
   -V, --version                   Print version
@@ -728,7 +708,7 @@ mod tests {
             "--peer-device=1",
             "--class",
             "d2d-direct",
-            "--engine",
+            "--queue-group",
             "2",
             "--size",
             "256MiB",
@@ -737,7 +717,8 @@ mod tests {
             "--warmup",
             "500ms",
             "--single",
-            "--device-timestamps",
+            "--timing",
+            "device-timestamps",
             "--format",
             "csv",
             "--no-histogram",
@@ -749,7 +730,7 @@ mod tests {
                 device: Some(0),
                 peer_device: Some(1),
                 transfer_class: Some(TransferClass::D2DDirect),
-                queue_ordinal: Some(2),
+                queue_group: Some(2),
                 size_bytes: 256 * 1024 * 1024,
                 samples: 96,
                 warmup: Duration::from_millis(500),
@@ -763,17 +744,12 @@ mod tests {
     }
 
     #[test]
-    fn timing_option_and_alias_agree() {
+    fn timing_option_selects_device_timestamps() {
         let action = parse_ok(&["bench", "--single", "--timing", "device-timestamps"]);
         let CliAction::Command(Command::Bench(options)) = action else {
             panic!("expected bench command");
         };
         assert_eq!(options.timing, TimingMode::DeviceTimestamps);
-
-        assert!(
-            parse_err(&["bench", "--timing", "wall-clock", "--device-timestamps"])
-                .contains("conflicts")
-        );
     }
 
     #[test]
@@ -798,7 +774,7 @@ mod tests {
         assert!(parse_err(&["bench", "--single", "--saturation"]).contains("conflicts"));
         assert!(parse_err(&["bench", "-s", "--single"]).contains("conflicts"));
         assert!(
-            parse_err(&["bench", "--device-timestamps"])
+            parse_err(&["bench", "--timing", "device-timestamps"])
                 .contains("supports wall-clock timing only")
         );
     }
@@ -811,6 +787,24 @@ mod tests {
         };
 
         assert_eq!(options.transfer_class, None);
+    }
+
+    #[test]
+    fn every_documented_transfer_class_is_exposed() {
+        for (name, expected) in [
+            ("h2d", Some(TransferClass::H2D)),
+            ("d2h", Some(TransferClass::D2H)),
+            ("same", Some(TransferClass::D2DSameDevice)),
+            ("direct", Some(TransferClass::D2DDirect)),
+            ("staged", Some(TransferClass::D2DStaged)),
+            ("all", None),
+        ] {
+            let CliAction::Command(Command::Bench(options)) = parse_ok(&["bench", "--class", name])
+            else {
+                panic!("expected bench command");
+            };
+            assert_eq!(options.transfer_class, expected);
+        }
     }
 
     #[test]
@@ -849,16 +843,27 @@ mod tests {
         assert!(parse_err(&["bench", "--samples", "9"]).contains("at least 10"));
         assert!(parse_err(&["bench", "--size", "4XB"]).contains("invalid size unit"));
         assert!(parse_err(&["bench", "--unknown"]).contains("unknown option"));
+        for removed in [
+            "--engine",
+            "--queue",
+            "--queue-ordinal",
+            "--transfer-class",
+            "--device-timestamps",
+        ] {
+            assert!(parse_err(&["bench", removed]).contains("unknown option"));
+        }
     }
 
     #[test]
     fn embedded_help_mentions_required_commands_and_flags() {
         assert!(help(HelpTopic::General).contains("xfer list"));
         assert!(help(HelpTopic::General).contains("xfer bench"));
-        assert!(help(HelpTopic::Bench).contains("--device-timestamps"));
+        assert!(help(HelpTopic::Bench).contains("device-timestamps"));
         assert!(help(HelpTopic::Bench).contains("--format FORMAT"));
         assert!(help(HelpTopic::Bench).contains("--summary-only"));
         assert!(help(HelpTopic::Bench).contains("--single"));
+        assert!(help(HelpTopic::Bench).contains("--queue-group ID"));
+        assert!(!help(HelpTopic::Bench).contains("--engine"));
         assert!(help(HelpTopic::Bench).contains("default 2GiB"));
         assert!(version().starts_with("xfer "));
     }
