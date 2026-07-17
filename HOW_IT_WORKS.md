@@ -166,6 +166,7 @@ allocations owned by different devices. `peer-access=yes` or `no` is a separate
 capability result. Neither observation proves whether the physical path was
 device-to-device, traversed a host bridge, or was internally staged by the
 driver. A Level Zero trace or platform counter is required to prove the route.
+`xfer` does not currently collect those traces or counters.
 
 The reported PCIe topology is derived from endpoint ancestry in sysfs. It
 distinguishes a common root port, a shared upstream bridge, different root

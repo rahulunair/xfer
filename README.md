@@ -6,8 +6,7 @@ the Level Zero API. It verifies every copy and clearly separates:
 - direct device-to-device copy requests;
 - explicit copies staged through pinned host memory;
 - Level Zero peer-access permission;
-- PCIe attachment topology;
-- the physical P2P route, which requires tracing or platform counters to prove.
+- PCIe attachment topology.
 
 ## Quick Start
 
@@ -26,8 +25,7 @@ copy-capable queues:
 ./target/release/xfer bench --class d2d-direct --saturation --summary-only
 ```
 
-Pairs run sequentially. Host byte verification is automatic and outside the
-timed interval.
+Pairs run sequentially.
 
 ## Common Commands
 
@@ -67,8 +65,6 @@ D2D direct dev0 -> dev1
     peer access         supported (zeDeviceCanAccessPeer = yes)
     PCIe topology       different host bridges pci0000:0a -> pci0000:61
     host staging        none requested by xfer
-    physical P2P        not measured; requires platform counters or tracing
-    verification        dev1, engine 0 / queue 0; outside timing
 
                 lower        median       upper
   time        [ 13.779 ms    13.782 ms    13.783 ms   ]
@@ -100,8 +96,6 @@ upper tail are not a stable roofline.
 
 - `direct` means one Level Zero copy request between allocations on different
   GPUs. `xfer` does not insert a host stage into that timed path.
-- Destination verification copies bytes back after timing; it is not part of
-  the measured transfer and is not a staging leg.
 - `explicit-staged` measures D2H, a synchronization point, then H2D through
   pinned host memory. It reports logical payload rate and 2x copy traffic.
 - `peer access: supported` is the Level Zero P2P capability result. It does not

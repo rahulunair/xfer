@@ -206,13 +206,7 @@ const SUMMARY_HEADERS: [&str; 7] = [
     "MAD GB/s",
     "outliers",
 ];
-const P2P_FACT_HEADERS: [&str; 5] = [
-    "pair",
-    "copy request",
-    "peer access",
-    "PCIe topology",
-    "physical P2P",
-];
+const P2P_FACT_HEADERS: [&str; 4] = ["pair", "copy request", "peer access", "PCIe topology"];
 
 fn render_summary_lines(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
     if cases.is_empty() {
@@ -328,7 +322,7 @@ fn append_skipped_cases(lines: &mut Vec<String>, cases: &[BenchCase], color: Col
 }
 
 fn render_p2p_facts(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
-    let mut facts = Vec::<[String; 5]>::new();
+    let mut facts = Vec::<[String; 4]>::new();
     for case in cases {
         let Operation::Direct { peer_access, route } = &case.operation else {
             continue;
@@ -342,14 +336,13 @@ fn render_p2p_facts(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
             "Level Zero direct".to_owned(),
             peer_access.as_field().to_owned(),
             render_peer_route_short(route).to_owned(),
-            "not measured".to_owned(),
         ]);
     }
     if facts.is_empty() {
         return Vec::new();
     }
 
-    let widths = std::array::from_fn::<_, 5, _>(|index| {
+    let widths = std::array::from_fn::<_, 4, _>(|index| {
         facts
             .iter()
             .map(|fact| fact[index].len())
@@ -373,12 +366,11 @@ fn render_p2p_facts(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
     for fact in facts {
         let topology = format!("{:<width$}", fact[3], width = widths[3]);
         lines.push(format!(
-            "  {:<w0$}  {:<w1$}  {:<w2$}  {}  {}",
+            "  {:<w0$}  {:<w1$}  {:<w2$}  {}",
             fact[0],
             fact[1],
             fact[2],
             paint(color, "\u{1b}[36m", &topology),
-            paint(color, "\u{1b}[33m", &fact[4]),
             w0 = widths[0],
             w1 = widths[1],
             w2 = widths[2]
@@ -400,11 +392,6 @@ fn append_summary_notes(lines: &mut Vec<String>, cases: &[BenchCase], color: Col
             color,
             "\u{1b}[2m",
             "  direct: one Level Zero copy request; peer access is the API capability result",
-        ));
-        lines.push(paint(
-            color,
-            "\u{1b}[2m",
-            "  physical P2P: not measured unless a platform trace or traffic counter is collected",
         ));
     }
     if has_staged {
@@ -712,21 +699,6 @@ fn append_path_evidence(lines: &mut Vec<String>, case: &BenchCase) {
             );
             push_detail(lines, "PCIe topology", render_peer_route(route));
             push_detail(lines, "host staging", "none requested by xfer");
-            push_detail(
-                lines,
-                "physical P2P",
-                "not measured; requires platform counters or tracing",
-            );
-            if let Some(stream) = case.verification_stream {
-                push_detail(
-                    lines,
-                    "verification",
-                    format!(
-                        "{}, engine {} / queue {}; outside timing",
-                        case.destination, stream.group_ordinal, stream.queue_index
-                    ),
-                );
-            }
         }
         Operation::ExplicitStaged { route } => {
             push_detail(lines, "copy request", "GPU -> pinned host -> GPU");
@@ -737,7 +709,6 @@ fn append_path_evidence(lines: &mut Vec<String>, case: &BenchCase) {
                 format!("{}; direct peer route not used", render_peer_route(route)),
             );
             push_detail(lines, "host staging", "yes, explicitly requested by xfer");
-            push_detail(lines, "physical P2P", "no; transfer is host-staged");
         }
         Operation::HostToDevice => {
             push_detail(lines, "copy request", "pinned host -> GPU memory");
@@ -1464,7 +1435,7 @@ mod tests {
         assert!(output.contains("D2D direct dev0 -> dev1"));
         assert!(output.contains("P2P path facts"));
         assert!(output.contains("Level Zero direct"));
-        assert!(output.contains("not measured"));
+        assert!(!output.contains("physical P2P"));
         assert!(!output.contains("unverified"));
         assert!(output.contains("D2D staged dev0 -> dev1"));
         assert!(output.contains("pinned host"));
@@ -1578,8 +1549,9 @@ mod tests {
         assert!(text.contains("direct GPU-memory copy (Level Zero)"));
         assert!(text.contains("not supported (zeDeviceCanAccessPeer = no)"));
         assert!(text.contains("different root ports"));
-        assert!(text.contains("physical P2P        not measured"));
         assert!(text.contains("host staging        none requested by xfer"));
+        assert!(!text.contains("physical P2P"));
+        assert!(!text.contains("verification        "));
         assert!(text.contains("engine 0 does not advertise copy capability"));
         assert!(!text.contains("ordinal"));
     }
