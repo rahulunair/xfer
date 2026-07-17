@@ -4,6 +4,7 @@ use super::model::{
 };
 use crate::cli::TransferClass;
 use crate::histogram::Histogram;
+use crate::stats::Summary;
 
 pub fn render_list(report: &ListReport) -> String {
     let mut lines = Vec::new();
@@ -171,68 +172,150 @@ fn render_case_lines(case: &BenchCase, options: &TextOptions) -> Vec<String> {
             summary,
             samples_gb_s,
         } => {
-            lines.push(String::new());
-            let [lower, estimate, upper] = format_seconds_triplet([
-                time_summary.median_confidence.lower_bound,
-                time_summary.median,
-                time_summary.median_confidence.upper_bound,
-            ]);
-            lines.push(format!(
-                "  time        [ {lower:>12}  {estimate:>12}  {upper:>12} ]"
+            lines.extend(render_measured_lines(
+                case,
+                time_summary,
+                summary,
+                samples_gb_s,
+                options,
             ));
-            let [lower, estimate, upper] = format_rate_triplet([
-                summary.median_confidence.lower_bound,
-                summary.median,
-                summary.median_confidence.upper_bound,
-            ]);
-            lines.push(format!(
-                "  throughput  [ {lower:>12}  {estimate:>12}  {upper:>12} ]"
-            ));
-            lines.push("                lower        median         upper".to_owned());
-            lines.push(format!(
-                "                {:.0}% bootstrap confidence interval ({} resamples)",
-                summary.median_confidence.confidence_level * 100.0,
-                summary.median_confidence.resamples
-            ));
-            let [p5, _, p95] = format_rate_triplet([summary.p5, summary.median, summary.p95]);
-            lines.push(format!("  sample       p5 {p5}, p95 {p95}"));
-            let resolution_note = if summary.mad == 0.0 {
-                " (no variation at timer resolution)"
-            } else {
-                ""
-            };
-            lines.push(format!(
-                "  variability  MAD {} GB/s{resolution_note}",
-                format_nonzero_metric(summary.mad, 1)
-            ));
-            if let Some(spec) = render_negotiated_pcie_percent(summary.median, &case.pcie_link) {
-                lines.push(format!("  link usage   {spec}"));
-            }
-            lines.push(format!(
-                "  outliers     {}/{} ({} mild, {} severe)",
-                time_summary.outliers.counts.mild + time_summary.outliers.counts.severe,
-                time_summary.count,
-                time_summary.outliers.counts.mild,
-                time_summary.outliers.counts.severe
-            ));
-
-            if options.include_histogram {
-                if let Some(histogram) = Histogram::from_samples(samples_gb_s, 12) {
-                    if let Some(rows) = histogram.render_ascii(18, Some(summary.median)) {
-                        lines.push(String::new());
-                        for row in rows {
-                            lines.push(format!("    {row}"));
-                        }
-                    }
-                }
-            }
         }
         CaseOutcome::Skipped { reason } => {
-            lines.push(format!("  skipped: {}", sanitize_human_text(reason)));
+            lines.push(paint(
+                options.color,
+                "\u{1b}[33m",
+                &format!("  skipped: {}", sanitize_human_text(reason)),
+            ));
         }
     }
 
     lines
+}
+
+fn render_measured_lines(
+    case: &BenchCase,
+    time_summary: &Summary,
+    summary: &Summary,
+    samples_gb_s: &[f64],
+    options: &TextOptions,
+) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    let time = format_seconds_triplet([
+        time_summary.median_confidence.lower_bound,
+        time_summary.median,
+        time_summary.median_confidence.upper_bound,
+    ]);
+    let throughput = format_rate_triplet([
+        summary.median_confidence.lower_bound,
+        summary.median,
+        summary.median_confidence.upper_bound,
+    ]);
+    let [heading, time, throughput] = estimate_table(time, throughput, options.color);
+    lines.extend([heading, time, throughput]);
+    lines.push(paint(
+        options.color,
+        "\u{1b}[2m",
+        &format!(
+            "{:16}{:.0}% bootstrap confidence interval ({} resamples)",
+            "",
+            summary.median_confidence.confidence_level * 100.0,
+            summary.median_confidence.resamples
+        ),
+    ));
+
+    let [p5, _, p95] = format_rate_triplet([summary.p5, summary.median, summary.p95]);
+    lines.push(format!("  sample       p5 {p5}, p95 {p95}"));
+    let resolution_note = if summary.mad == 0.0 {
+        " (no variation at timer resolution)"
+    } else {
+        ""
+    };
+    lines.push(format!(
+        "  variability  MAD {} GB/s{resolution_note}",
+        format_nonzero_metric(summary.mad, 1)
+    ));
+    if let Some(spec) = render_negotiated_pcie_percent(summary.median, &case.pcie_link) {
+        lines.push(format!("  link usage   {spec}"));
+    }
+
+    let outlier_line = format!(
+        "  outliers     {}/{} ({} mild, {} severe)",
+        time_summary.outliers.counts.mild + time_summary.outliers.counts.severe,
+        time_summary.count,
+        time_summary.outliers.counts.mild,
+        time_summary.outliers.counts.severe
+    );
+    let outlier_color = if time_summary.outliers.counts.severe > 0 {
+        "\u{1b}[31m"
+    } else if time_summary.outliers.counts.mild > 0 {
+        "\u{1b}[33m"
+    } else {
+        "\u{1b}[2m"
+    };
+    lines.push(paint(options.color, outlier_color, &outlier_line));
+
+    if options.include_histogram {
+        append_histogram(&mut lines, samples_gb_s, summary.median, options.color);
+    }
+    lines
+}
+
+fn append_histogram(lines: &mut Vec<String>, samples: &[f64], median: f64, color: ColorMode) {
+    let Some(histogram) = Histogram::from_samples(samples, 12) else {
+        return;
+    };
+    let Some(rows) = render_histogram(&histogram, Some(median), color) else {
+        return;
+    };
+
+    lines.push(String::new());
+    lines.push(paint(
+        color,
+        "\u{1b}[1;36m",
+        &format!("  distribution  GB/s ({} samples)", histogram.sample_count),
+    ));
+    lines.extend(rows.into_iter().map(|row| format!("    {row}")));
+}
+
+fn render_histogram(
+    histogram: &Histogram,
+    median: Option<f64>,
+    color: ColorMode,
+) -> Option<Vec<String>> {
+    const BAR_WIDTH: usize = 24;
+
+    if color == ColorMode::Never {
+        return histogram.render_ascii(BAR_WIDTH, median);
+    }
+
+    let rows = histogram.rows(BAR_WIDTH, median)?;
+    let count_width = rows
+        .iter()
+        .map(|row| row.count.to_string().len())
+        .max()
+        .unwrap_or(1);
+    Some(
+        rows.into_iter()
+            .map(|row| {
+                let bar = "█".repeat(row.bar.len());
+                let padded = format!("{bar:<BAR_WIDTH$}");
+                let painted_bar = if row.marks_median {
+                    paint(color, "\u{1b}[1;32m", &padded)
+                } else {
+                    paint(color, "\u{1b}[36m", &padded)
+                };
+                let marker = if row.marks_median {
+                    format!("  {}", paint(color, "\u{1b}[1;32m", "◆ median"))
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{} │ {painted_bar} {:>count_width$}{marker}",
+                    row.label, row.count
+                )
+            })
+            .collect(),
+    )
 }
 
 fn case_label(case: &BenchCase) -> String {
@@ -312,6 +395,37 @@ fn format_percent(value: f64) -> String {
 
 fn format_seconds_triplet(values: [f64; 3]) -> [String; 3] {
     format_triplet(values, 2, format_seconds_with_decimals)
+}
+
+fn estimate_table(time: [String; 3], throughput: [String; 3], color: ColorMode) -> [String; 3] {
+    const LABEL_WIDTH: usize = 12;
+    const VALUE_GAP: &str = "  ";
+
+    let value_width = time
+        .iter()
+        .chain(&throughput)
+        .map(String::len)
+        .chain(["lower".len(), "median".len(), "upper".len()])
+        .max()
+        .unwrap_or(0);
+    let cell = |value: &str, style: &str| paint(color, style, &format!("{value:<value_width$}"));
+    let heading = format!(
+        "{:16}{}{VALUE_GAP}{}{VALUE_GAP}{}",
+        "",
+        cell("lower", "\u{1b}[2m"),
+        cell("median", "\u{1b}[2m"),
+        cell("upper", "\u{1b}[2m")
+    );
+    let row = |label: &str, values: [String; 3]| {
+        format!(
+            "  {label:<LABEL_WIDTH$}[ {}{VALUE_GAP}{}{VALUE_GAP}{} ]",
+            cell(&values[0], "\u{1b}[2m"),
+            cell(&values[1], "\u{1b}[1;32m"),
+            cell(&values[2], "\u{1b}[2m")
+        )
+    };
+
+    [heading, row("time", time), row("throughput", throughput)]
 }
 
 fn format_seconds_with_decimals(seconds: f64, decimals: usize) -> String {
@@ -541,6 +655,30 @@ mod tests {
     }
 
     #[test]
+    fn estimate_table_uses_shared_value_columns() {
+        let [heading, time, throughput] = estimate_table(
+            [
+                "19.419 ms".to_owned(),
+                "19.425 ms".to_owned(),
+                "19.429 ms".to_owned(),
+            ],
+            [
+                "13.816 GB/s".to_owned(),
+                "13.819 GB/s".to_owned(),
+                "13.823 GB/s".to_owned(),
+            ],
+            ColorMode::Never,
+        );
+
+        assert_eq!(heading.find("lower"), time.find("19.419"));
+        assert_eq!(heading.find("lower"), throughput.find("13.816"));
+        assert_eq!(heading.find("median"), time.find("19.425"));
+        assert_eq!(heading.find("median"), throughput.find("13.819"));
+        assert_eq!(heading.find("upper"), time.find("19.429"));
+        assert_eq!(heading.find("upper"), throughput.find("13.823"));
+    }
+
+    #[test]
     fn omits_histogram_when_requested() {
         let report = BenchReport {
             cases: vec![measured_case()],
@@ -554,6 +692,22 @@ mod tests {
         );
 
         assert!(!output.contains(" | #"));
+    }
+
+    #[test]
+    fn ansi_histogram_uses_unicode_bars_and_median_marker() {
+        let output = render_case_text(
+            &measured_case(),
+            &TextOptions {
+                include_histogram: true,
+                color: ColorMode::Ansi,
+            },
+        );
+
+        assert!(output.contains("distribution  GB/s"));
+        assert!(output.contains('█'));
+        assert!(output.contains('│'));
+        assert!(output.contains("◆ median"));
     }
 
     #[test]
