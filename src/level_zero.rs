@@ -68,6 +68,19 @@ impl fmt::Display for LevelZeroError {
 
 impl StdError for LevelZeroError {}
 
+impl LevelZeroError {
+    #[must_use]
+    pub fn is_capability_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Ze { result, .. }
+                if *result == raw::ZE_RESULT_ERROR_UNSUPPORTED_FEATURE
+                    || *result == raw::ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE
+                    || *result == raw::ZE_RESULT_ERROR_NOT_AVAILABLE
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
     Gpu,
@@ -596,6 +609,8 @@ impl<'context> CommandList<'context> {
     ///
     /// The caller must keep `dst`, `src`, `signal`, and all `wait_events` alive
     /// until any queue execution that uses this command list has completed.
+    /// The caller must not access either allocation, or reset, destroy, or
+    /// reuse the command list or events, while Level Zero may access them.
     pub unsafe fn append_host_to_device(
         &self,
         dst: &DeviceAllocation<'_>,
@@ -622,6 +637,8 @@ impl<'context> CommandList<'context> {
     ///
     /// The caller must keep `dst`, `src`, `signal`, and all `wait_events` alive
     /// until any queue execution that uses this command list has completed.
+    /// The caller must not access either allocation, or reset, destroy, or
+    /// reuse the command list or events, while Level Zero may access them.
     pub unsafe fn append_device_to_host(
         &self,
         dst: &HostAllocation<'_>,
@@ -648,6 +665,8 @@ impl<'context> CommandList<'context> {
     ///
     /// The caller must keep `dst`, `src`, `signal`, and all `wait_events` alive
     /// until any queue execution that uses this command list has completed.
+    /// The caller must not access either allocation, or reset, destroy, or
+    /// reuse the command list or events, while Level Zero may access them.
     pub unsafe fn append_device_to_device(
         &self,
         dst: &DeviceAllocation<'_>,
@@ -1239,6 +1258,31 @@ mod tests {
             error
                 .to_string()
                 .contains(&raw::ZE_RESULT_ERROR_INVALID_ARGUMENT.to_string())
+        );
+    }
+
+    #[test]
+    fn classifies_only_capability_results_as_unavailable() {
+        for result in [
+            raw::ZE_RESULT_ERROR_UNSUPPORTED_FEATURE,
+            raw::ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE,
+            raw::ZE_RESULT_ERROR_NOT_AVAILABLE,
+        ] {
+            assert!(
+                LevelZeroError::Ze {
+                    operation: "unit",
+                    result,
+                }
+                .is_capability_unavailable()
+            );
+        }
+
+        assert!(
+            !LevelZeroError::Ze {
+                operation: "unit",
+                result: raw::ZE_RESULT_ERROR_DEVICE_LOST,
+            }
+            .is_capability_unavailable()
         );
     }
 

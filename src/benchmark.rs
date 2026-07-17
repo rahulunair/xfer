@@ -207,6 +207,12 @@ pub fn bench(options: &BenchOptions) -> Result<BenchReport> {
             match execute_case(&topology, &plan, options, byte_count) {
                 Ok(outcome) => outcome,
                 Err(CaseExecutionError::Skip(reason)) => CaseOutcome::Skipped { reason },
+                Err(CaseExecutionError::Fatal(BenchmarkError::LevelZeroOperation {
+                    phase,
+                    error,
+                })) if error.is_capability_unavailable() => CaseOutcome::Skipped {
+                    reason: format!("{phase}: {error}"),
+                },
                 Err(CaseExecutionError::Fatal(error)) => return Err(error),
             }
         };
