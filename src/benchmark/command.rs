@@ -9,7 +9,7 @@ use crate::output::Operation;
 use super::error::{BenchmarkError, CaseExecutionError, ze_fatal};
 use super::plan::CasePlan;
 
-const QUEUE_SYNC_TIMEOUT_NS: u64 = u64::MAX;
+pub(crate) const QUEUE_SYNC_TIMEOUT_NS: u64 = u64::MAX;
 
 pub(crate) fn sample_h2d(
     timing: TimingMode,
@@ -242,18 +242,31 @@ fn time_h2d_sync(
     Ok(started.elapsed())
 }
 
-fn prepare_h2d_list(
+pub(crate) fn prepare_h2d_list(
     list: &ze::CommandList<'_>,
     dst: &ze::DeviceAllocation<'_>,
     src: &ze::HostAllocation<'_>,
     bytes: usize,
     signal: Option<&ze::Event<'_>>,
 ) -> ze::Result<()> {
+    prepare_h2d_region(list, dst, 0, src, 0, bytes, signal)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_h2d_region(
+    list: &ze::CommandList<'_>,
+    dst: &ze::DeviceAllocation<'_>,
+    dst_offset: usize,
+    src: &ze::HostAllocation<'_>,
+    src_offset: usize,
+    bytes: usize,
+    signal: Option<&ze::Event<'_>>,
+) -> ze::Result<()> {
     list.reset()?;
     unsafe {
-        // SAFETY: source and destination allocations outlive queue execution, byte count is
-        // bounded by the wrapper, and every caller synchronizes the queue before reuse/drop.
-        list.append_host_to_device(dst, src, bytes, signal, &[])?;
+        // SAFETY: source and destination allocations outlive queue execution; offsets and byte
+        // count are bounded by the wrapper, and callers synchronize before reuse or host access.
+        list.append_host_to_device_region(dst, dst_offset, src, src_offset, bytes, signal, &[])?;
     }
     list.close()
 }
@@ -284,18 +297,31 @@ fn time_d2h_sync(
     Ok(started.elapsed())
 }
 
-fn prepare_d2h_list(
+pub(crate) fn prepare_d2h_list(
     list: &ze::CommandList<'_>,
     dst: &mut ze::HostAllocation<'_>,
     src: &ze::DeviceAllocation<'_>,
     bytes: usize,
     signal: Option<&ze::Event<'_>>,
 ) -> ze::Result<()> {
+    prepare_d2h_region(list, dst, 0, src, 0, bytes, signal)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_d2h_region(
+    list: &ze::CommandList<'_>,
+    dst: &mut ze::HostAllocation<'_>,
+    dst_offset: usize,
+    src: &ze::DeviceAllocation<'_>,
+    src_offset: usize,
+    bytes: usize,
+    signal: Option<&ze::Event<'_>>,
+) -> ze::Result<()> {
     list.reset()?;
     unsafe {
-        // SAFETY: source and destination allocations outlive queue execution, byte count is
-        // bounded by the wrapper, and every caller synchronizes the queue before reuse/drop.
-        list.append_device_to_host(dst, src, bytes, signal, &[])?;
+        // SAFETY: source and destination allocations outlive queue execution; offsets and byte
+        // count are bounded by the wrapper, and callers synchronize before reuse or host access.
+        list.append_device_to_host_region(dst, dst_offset, src, src_offset, bytes, signal, &[])?;
     }
     list.close()
 }
@@ -314,18 +340,31 @@ fn time_d2d_sync(
     Ok(started.elapsed())
 }
 
-fn prepare_d2d_list(
+pub(crate) fn prepare_d2d_list(
     list: &ze::CommandList<'_>,
     dst: &ze::DeviceAllocation<'_>,
     src: &ze::DeviceAllocation<'_>,
     bytes: usize,
     signal: Option<&ze::Event<'_>>,
 ) -> ze::Result<()> {
+    prepare_d2d_region(list, dst, 0, src, 0, bytes, signal)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_d2d_region(
+    list: &ze::CommandList<'_>,
+    dst: &ze::DeviceAllocation<'_>,
+    dst_offset: usize,
+    src: &ze::DeviceAllocation<'_>,
+    src_offset: usize,
+    bytes: usize,
+    signal: Option<&ze::Event<'_>>,
+) -> ze::Result<()> {
     list.reset()?;
     unsafe {
-        // SAFETY: source and destination allocations outlive queue execution, byte count is
-        // bounded by the wrapper, and every caller synchronizes the queue before reuse/drop.
-        list.append_device_to_device(dst, src, bytes, signal, &[])?;
+        // SAFETY: source and destination allocations outlive queue execution; offsets and byte
+        // count are bounded by the wrapper, and callers synchronize before reuse or allocation access.
+        list.append_device_to_device_region(dst, dst_offset, src, src_offset, bytes, signal, &[])?;
     }
     list.close()
 }

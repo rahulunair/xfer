@@ -425,6 +425,14 @@ impl ContextState {
             Err(LevelZeroError::SubmissionStateUnknown { operation })
         }
     }
+
+    fn require_submission_allowed(&self, operation: &'static str) -> Result<()> {
+        if self.poisoned.get() {
+            Err(LevelZeroError::SubmissionStateUnknown { operation })
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -467,7 +475,16 @@ impl<'driver> Context<'driver> {
         device: &Device,
         queue_group_ordinal: u32,
     ) -> Result<CommandQueue<'_>> {
-        CommandQueue::new(self, device, queue_group_ordinal)
+        self.create_command_queue_at(device, queue_group_ordinal, 0)
+    }
+
+    pub fn create_command_queue_at(
+        &self,
+        device: &Device,
+        queue_group_ordinal: u32,
+        queue_index: u32,
+    ) -> Result<CommandQueue<'_>> {
+        CommandQueue::new(self, device, queue_group_ordinal, queue_index)
     }
 
     pub fn create_command_list(
@@ -547,13 +564,14 @@ impl<'context> CommandQueue<'context> {
         context: &'context Context<'_>,
         device: &Device,
         queue_group_ordinal: u32,
+        queue_index: u32,
     ) -> Result<Self> {
         context.ensure_device(device)?;
         let desc = raw::ze_command_queue_desc_t {
             stype: raw::ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC,
             pNext: ptr::null(),
             ordinal: queue_group_ordinal,
-            index: 0,
+            index: queue_index,
             flags: 0,
             mode: raw::ZE_COMMAND_QUEUE_MODE_DEFAULT,
             priority: raw::ZE_COMMAND_QUEUE_PRIORITY_NORMAL,
@@ -583,7 +601,7 @@ impl<'context> CommandQueue<'context> {
 
     pub fn execute(&self, lists: &[&CommandList<'_>]) -> Result<()> {
         self.context_state
-            .require_release_safe("zeCommandQueueExecuteCommandLists")?;
+            .require_submission_allowed("zeCommandQueueExecuteCommandLists")?;
         for list in lists {
             if self.context != list.context {
                 return Err(LevelZeroError::IncompatibleObjects {
@@ -600,7 +618,7 @@ impl<'context> CommandQueue<'context> {
             if self.queue_group_ordinal != list.queue_group_ordinal {
                 return Err(LevelZeroError::IncompatibleObjects {
                     operation: "zeCommandQueueExecuteCommandLists",
-                    reason: "queue and command list use different engine IDs",
+                    reason: "queue and command list use different queue-group ordinals",
                 });
             }
         }
@@ -753,6 +771,28 @@ impl<'context> CommandList<'context> {
         signal: Option<&Event<'_>>,
         wait_events: &[&Event<'_>],
     ) -> Result<()> {
+        unsafe {
+            // SAFETY: forwarded from this function's caller contract.
+            self.append_host_to_device_region(dst, 0, src, 0, bytes, signal, wait_events)
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must keep `dst`, `src`, `signal`, and all `wait_events` alive
+    /// until queue execution completes. Source and destination regions must not
+    /// be accessed or overlapped incompatibly while Level Zero may use them.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn append_host_to_device_region(
+        &self,
+        dst: &DeviceAllocation<'_>,
+        dst_offset: usize,
+        src: &HostAllocation<'_>,
+        src_offset: usize,
+        bytes: usize,
+        signal: Option<&Event<'_>>,
+        wait_events: &[&Event<'_>],
+    ) -> Result<()> {
         self.context_state
             .require_release_safe("zeCommandListAppendMemoryCopy")?;
         self.ensure_context(dst.context, "zeCommandListAppendMemoryCopy(destination)")?;
@@ -764,8 +804,10 @@ impl<'context> CommandList<'context> {
             self.append_memory_copy_raw(
                 dst.ptr(),
                 dst.len,
+                dst_offset,
                 src.ptr(),
                 src.len,
+                src_offset,
                 bytes,
                 signal,
                 wait_events,
@@ -787,6 +829,28 @@ impl<'context> CommandList<'context> {
         signal: Option<&Event<'_>>,
         wait_events: &[&Event<'_>],
     ) -> Result<()> {
+        unsafe {
+            // SAFETY: forwarded from this function's caller contract.
+            self.append_device_to_host_region(dst, 0, src, 0, bytes, signal, wait_events)
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must keep `dst`, `src`, `signal`, and all `wait_events` alive
+    /// until queue execution completes. Source and destination regions must not
+    /// be accessed or overlapped incompatibly while Level Zero may use them.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn append_device_to_host_region(
+        &self,
+        dst: &HostAllocation<'_>,
+        dst_offset: usize,
+        src: &DeviceAllocation<'_>,
+        src_offset: usize,
+        bytes: usize,
+        signal: Option<&Event<'_>>,
+        wait_events: &[&Event<'_>],
+    ) -> Result<()> {
         self.context_state
             .require_release_safe("zeCommandListAppendMemoryCopy")?;
         self.ensure_context(dst.context, "zeCommandListAppendMemoryCopy(destination)")?;
@@ -798,8 +862,10 @@ impl<'context> CommandList<'context> {
             self.append_memory_copy_raw(
                 dst.ptr(),
                 dst.len,
+                dst_offset,
                 src.ptr(),
                 src.len,
+                src_offset,
                 bytes,
                 signal,
                 wait_events,
@@ -821,6 +887,28 @@ impl<'context> CommandList<'context> {
         signal: Option<&Event<'_>>,
         wait_events: &[&Event<'_>],
     ) -> Result<()> {
+        unsafe {
+            // SAFETY: forwarded from this function's caller contract.
+            self.append_device_to_device_region(dst, 0, src, 0, bytes, signal, wait_events)
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must keep `dst`, `src`, `signal`, and all `wait_events` alive
+    /// until queue execution completes. Source and destination regions must not
+    /// be accessed or overlapped incompatibly while Level Zero may use them.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn append_device_to_device_region(
+        &self,
+        dst: &DeviceAllocation<'_>,
+        dst_offset: usize,
+        src: &DeviceAllocation<'_>,
+        src_offset: usize,
+        bytes: usize,
+        signal: Option<&Event<'_>>,
+        wait_events: &[&Event<'_>],
+    ) -> Result<()> {
         self.context_state
             .require_release_safe("zeCommandListAppendMemoryCopy")?;
         self.ensure_context(dst.context, "zeCommandListAppendMemoryCopy(destination)")?;
@@ -832,8 +920,10 @@ impl<'context> CommandList<'context> {
             self.append_memory_copy_raw(
                 dst.ptr(),
                 dst.len,
+                dst_offset,
                 src.ptr(),
                 src.len,
+                src_offset,
                 bytes,
                 signal,
                 wait_events,
@@ -903,19 +993,31 @@ impl<'context> CommandList<'context> {
         &self,
         dst: NonNull<c_void>,
         dst_len: usize,
+        dst_offset: usize,
         src: NonNull<c_void>,
         src_len: usize,
+        src_offset: usize,
         bytes: usize,
         signal: Option<&Event<'_>>,
         wait_events: &[&Event<'_>],
     ) -> Result<()> {
-        if bytes > dst_len || bytes > src_len {
+        let dst_remaining = remaining_region_len(dst_len, dst_offset, bytes)?;
+        let src_remaining = remaining_region_len(src_len, src_offset, bytes)?;
+        if bytes > dst_remaining || bytes > src_remaining {
             return Err(LevelZeroError::CopyTooLarge {
                 requested: bytes,
-                dst_len,
-                src_len,
+                dst_len: dst_remaining,
+                src_len: src_remaining,
             });
         }
+        let dst: NonNull<c_void> = unsafe {
+            // SAFETY: dst_offset is within the destination allocation as checked above.
+            NonNull::new_unchecked(dst.as_ptr().cast::<u8>().add(dst_offset).cast())
+        };
+        let src: NonNull<c_void> = unsafe {
+            // SAFETY: src_offset is within the source allocation as checked above.
+            NonNull::new_unchecked(src.as_ptr().cast::<u8>().add(src_offset).cast())
+        };
 
         let wait_count = len_to_u32("zeCommandListAppendMemoryCopy", wait_events.len())?;
         let mut wait_handles = wait_events
@@ -958,6 +1060,14 @@ impl<'context> CommandList<'context> {
         };
         check("zeCommandListDestroy", result)
     }
+}
+
+fn remaining_region_len(len: usize, offset: usize, requested: usize) -> Result<usize> {
+    len.checked_sub(offset).ok_or(LevelZeroError::CopyTooLarge {
+        requested,
+        dst_len: len,
+        src_len: len,
+    })
 }
 
 impl Drop for CommandList<'_> {
@@ -1570,6 +1680,15 @@ mod tests {
     }
 
     #[test]
+    fn region_bounds_reject_offset_past_allocation_even_for_zero_bytes() {
+        assert_eq!(remaining_region_len(8, 8, 0), Ok(0));
+        assert!(matches!(
+            remaining_region_len(8, 9, 0),
+            Err(LevelZeroError::CopyTooLarge { requested: 0, .. })
+        ));
+    }
+
+    #[test]
     fn len_to_u32_rejects_overflow() {
         let error = len_to_u32("unit", usize::MAX).unwrap_err();
         assert_eq!(
@@ -1621,6 +1740,20 @@ mod tests {
         assert!(state.release_is_safe());
 
         state.poison();
+        assert!(!state.release_is_safe());
+        assert!(state.require_submission_allowed("unit submission").is_err());
+    }
+
+    #[test]
+    fn context_state_allows_parallel_queue_submissions_until_poisoned() {
+        let state = ContextState::default();
+        state.mark_submitted(false);
+
+        assert!(
+            state
+                .require_submission_allowed("second queue submission")
+                .is_ok()
+        );
         assert!(!state.release_is_safe());
     }
 
