@@ -22,7 +22,7 @@ mod verify;
 
 use std::io;
 
-use crate::cli::BenchOptions;
+use crate::cli::{BenchOptions, MIN_SAMPLES};
 use crate::output::{BenchReport, CaseOutcome, DeviceInfo, ListReport};
 
 use self::error::CaseExecutionError;
@@ -62,6 +62,7 @@ pub fn bench_with_reporter<R>(options: &BenchOptions, mut reporter: R) -> Result
 where
     R: Report,
 {
+    validate_options(options)?;
     let topology = discover_topology()?;
     if topology.devices.is_empty() {
         return Err(BenchmarkError::NoDevices);
@@ -141,6 +142,16 @@ where
     Ok(BenchReport { cases })
 }
 
+fn validate_options(options: &BenchOptions) -> Result<()> {
+    if options.samples < MIN_SAMPLES {
+        Err(BenchmarkError::InvalidFilter(format!(
+            "sample count must be at least {MIN_SAMPLES}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn emit_execution_event(fanout: &mut EventFanout<'_>, id: &CaseId, event: ExecutionEvent) {
     match event {
         ExecutionEvent::Warmup { duration } => {
@@ -169,5 +180,24 @@ where
 {
     fn event(&mut self, event: BenchEvent<'_>) -> io::Result<()> {
         self(event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_api_enforces_minimum_sample_count() {
+        let options = BenchOptions {
+            samples: MIN_SAMPLES - 1,
+            ..BenchOptions::default()
+        };
+
+        assert!(matches!(
+            validate_options(&options),
+            Err(BenchmarkError::InvalidFilter(message))
+                if message == "sample count must be at least 10"
+        ));
     }
 }
