@@ -1,7 +1,9 @@
 use std::io::{self, Write};
+use std::time::Duration;
 
 use crate::benchmark::{BenchEvent, Report};
 use crate::cli::OutputFormat;
+use indicatif::{ProgressBar, ProgressStyle};
 
 use super::csv::{BENCH_CSV_HEADER, render_case_csv};
 use super::model::TextOptions;
@@ -12,6 +14,126 @@ pub enum StatusMode {
     Interactive,
     Line,
     Disabled,
+}
+
+pub struct InteractiveReporter<R> {
+    inner: R,
+    progress: ProgressBar,
+    spinner_style: ProgressStyle,
+    sampling_style: ProgressStyle,
+    complete_style: ProgressStyle,
+}
+
+impl<R> InteractiveReporter<R> {
+    pub fn new(inner: R, color: super::model::ColorMode) -> Self {
+        let (spinner_template, sampling_template, complete_template) = match color {
+            super::model::ColorMode::Ansi => (
+                "{spinner:.cyan} {msg}",
+                "{spinner:.cyan} {msg} [{bar:20.cyan/bright_black}] {pos}/{len}",
+                "{spinner:.green} {msg}",
+            ),
+            super::model::ColorMode::Never => (
+                "{spinner} {msg}",
+                "{spinner} {msg} [{bar:20}] {pos}/{len}",
+                "{spinner} {msg}",
+            ),
+        };
+        let spinner_style = ProgressStyle::with_template(spinner_template)
+            .expect("static spinner template is valid")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+        let sampling_style = ProgressStyle::with_template(sampling_template)
+            .expect("static sampling template is valid")
+            .progress_chars("=> ");
+        let complete_style = ProgressStyle::with_template(complete_template)
+            .expect("static completion template is valid")
+            .tick_strings(&["✓"]);
+        let progress = ProgressBar::new(0);
+        progress.set_style(spinner_style.clone());
+        progress.enable_steady_tick(Duration::from_millis(80));
+
+        Self {
+            inner,
+            progress,
+            spinner_style,
+            sampling_style,
+            complete_style,
+        }
+    }
+
+    fn spinner(&self, message: String) {
+        self.progress.reset();
+        self.progress.set_style(self.spinner_style.clone());
+        self.progress.set_message(message);
+        self.progress.enable_steady_tick(Duration::from_millis(80));
+    }
+}
+
+impl<R> Drop for InteractiveReporter<R> {
+    fn drop(&mut self) {
+        self.progress.finish_and_clear();
+    }
+}
+
+impl<R> Report for InteractiveReporter<R>
+where
+    R: Report,
+{
+    fn event(&mut self, event: BenchEvent<'_>) -> io::Result<()> {
+        match &event {
+            BenchEvent::TopologyPlanned {
+                device_count,
+                case_count,
+            } => self.spinner(format!(
+                "Topology planned: {device_count} devices, {case_count} cases"
+            )),
+            BenchEvent::CaseStart { id, index, total } => self.spinner(format!(
+                "Benchmarking {} ({index}/{total})",
+                status_label_from_case_id(id.as_str())
+            )),
+            BenchEvent::WarmupStart { id, duration } => self.spinner(format!(
+                "Benchmarking {}: Warming up for {}",
+                status_label_from_case_id(id.as_str()),
+                format_duration(*duration)
+            )),
+            BenchEvent::SamplingStart { id, samples, .. } => {
+                self.progress.disable_steady_tick();
+                self.progress.reset();
+                self.progress.set_length(u64::from(*samples));
+                self.progress.set_position(0);
+                self.progress.set_style(self.sampling_style.clone());
+                self.progress.set_message(format!(
+                    "Benchmarking {}: Collecting",
+                    status_label_from_case_id(id.as_str())
+                ));
+            }
+            BenchEvent::SamplingProgress {
+                completed, total, ..
+            } => {
+                self.progress.set_length(u64::from(*total));
+                self.progress.set_position(u64::from(*completed));
+            }
+            BenchEvent::AnalysisStart { id } => self.spinner(format!(
+                "Benchmarking {}: Analyzing",
+                status_label_from_case_id(id.as_str())
+            )),
+            BenchEvent::CaseComplete { .. } | BenchEvent::CaseSkipped { .. } => {
+                self.progress.finish_and_clear();
+            }
+            BenchEvent::RunComplete {
+                case_count,
+                measured_count,
+                skipped_count,
+            } => {
+                self.progress.reset();
+                self.progress.set_style(self.complete_style.clone());
+                self.progress.finish_with_message(format!(
+                    "Complete: {case_count} cases, {measured_count} measured, {skipped_count} skipped"
+                ));
+            }
+        }
+
+        self.inner.event(event)
+    }
 }
 
 pub struct LiveReporter<W, E> {
@@ -179,11 +301,25 @@ where
                 estimated,
             } => {
                 let estimate = estimated.map_or_else(String::new, |duration| {
-                    format!(" in approximately {}", format_duration(duration))
+                    format!(" in estimated {}", format_duration(duration))
                 });
                 self.status(&format!(
                     "Benchmarking {}: Collecting {samples} samples{estimate}",
                     status_label_from_case_id(id.as_str())
+                ))
+            }
+            BenchEvent::SamplingProgress {
+                id,
+                completed,
+                total,
+            } => {
+                if self.status_mode != StatusMode::Interactive {
+                    return Ok(());
+                }
+                self.status(&format!(
+                    "Benchmarking {}: Collecting {} {completed}/{total} samples",
+                    status_label_from_case_id(id.as_str()),
+                    progress_bar(completed, total)
                 ))
             }
             BenchEvent::AnalysisStart { id } => self.status(&format!(
@@ -202,6 +338,16 @@ where
             )),
         }
     }
+}
+
+fn progress_bar(completed: u32, total: u32) -> String {
+    const WIDTH: usize = 20;
+    let filled = if total == 0 {
+        0
+    } else {
+        (completed.min(total) as usize * WIDTH) / total as usize
+    };
+    format!("[{}{}]", "=".repeat(filled), " ".repeat(WIDTH - filled))
 }
 
 #[cfg(test)]
@@ -349,7 +495,34 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         assert_eq!(
             stderr,
-            "Topology planned: 1 devices, 1 cases\nBenchmarking H2D host -> dev0 / engine 2 (1/1)\nBenchmarking H2D host -> dev0 / engine 2: Warming up for 10 ms\nBenchmarking H2D host -> dev0 / engine 2: Collecting 3 samples in approximately 30 ms\nBenchmarking H2D host -> dev0 / engine 2: Analyzing\nComplete: 1 cases, 1 measured, 0 skipped\n"
+            "Topology planned: 1 devices, 1 cases\nBenchmarking H2D host -> dev0 / engine 2 (1/1)\nBenchmarking H2D host -> dev0 / engine 2: Warming up for 10 ms\nBenchmarking H2D host -> dev0 / engine 2: Collecting 3 samples in estimated 30 ms\nBenchmarking H2D host -> dev0 / engine 2: Analyzing\nComplete: 1 cases, 1 measured, 0 skipped\n"
+        );
+    }
+
+    #[test]
+    fn tty_sampling_progress_overwrites_with_verified_sample_count() {
+        let id = CaseId::new("h2d/host-to-dev0/1KiB/engine-2/wall-clock".to_owned());
+        let mut reporter = LiveReporter::new(
+            Vec::new(),
+            Vec::new(),
+            OutputFormat::Text,
+            TextOptions::default(),
+            StatusMode::Interactive,
+        );
+
+        reporter
+            .event(BenchEvent::SamplingProgress {
+                id: &id,
+                completed: 25,
+                total: 50,
+            })
+            .expect("progress");
+
+        let (_, stderr) = reporter.into_inner();
+        let stderr = String::from_utf8(stderr).expect("stderr utf8");
+        assert_eq!(
+            stderr,
+            "\r\u{1b}[2KBenchmarking H2D host -> dev0 / engine 2: Collecting [==========          ] 25/50 samples"
         );
     }
 

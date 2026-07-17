@@ -115,7 +115,7 @@ fn measure_h2d(
 
     let label = plan.label();
     let mut durations = Vec::with_capacity(sample_capacity(options.samples)?);
-    for _ in 0..options.samples {
+    for sample_index in 0..options.samples {
         fill_pattern(verify.as_mut_slice(), SENTINEL_SEED);
         ze_fatal(
             copy_h2d_sync(&queue, &list, &device_dst, &verify, bytes),
@@ -140,6 +140,10 @@ fn measure_h2d(
         )?;
         verify_or_fail(verify.as_slice(), PATTERN_SEED, &label)?;
         durations.push(elapsed);
+        events(ExecutionEvent::SamplingProgress {
+            completed: sample_index + 1,
+            total: options.samples,
+        });
     }
 
     Ok(durations)
@@ -215,7 +219,7 @@ fn measure_d2h(
 
     let label = plan.label();
     let mut durations = Vec::with_capacity(sample_capacity(options.samples)?);
-    for _ in 0..options.samples {
+    for sample_index in 0..options.samples {
         fill_pattern(destination.as_mut_slice(), SENTINEL_SEED);
         let elapsed = sample_d2h(
             options.timing,
@@ -230,6 +234,10 @@ fn measure_d2h(
         )?;
         verify_or_fail(destination.as_slice(), PATTERN_SEED, &label)?;
         durations.push(elapsed);
+        events(ExecutionEvent::SamplingProgress {
+            completed: sample_index + 1,
+            total: options.samples,
+        });
     }
 
     Ok(durations)
@@ -310,7 +318,7 @@ fn measure_same_device(
 
     let label = plan.label();
     let mut durations = Vec::with_capacity(sample_capacity(options.samples)?);
-    for _ in 0..options.samples {
+    for sample_index in 0..options.samples {
         fill_pattern(host.as_mut_slice(), SENTINEL_SEED);
         ze_fatal(
             copy_h2d_sync(&queue, &list, &device_dst, &host, bytes),
@@ -333,6 +341,10 @@ fn measure_same_device(
         )?;
         verify_or_fail(host.as_slice(), PATTERN_SEED, &label)?;
         durations.push(elapsed);
+        events(ExecutionEvent::SamplingProgress {
+            completed: sample_index + 1,
+            total: options.samples,
+        });
     }
 
     Ok(durations)
@@ -426,7 +438,7 @@ fn measure_direct(
 
     let label = plan.label();
     let mut durations = Vec::with_capacity(sample_capacity(options.samples)?);
-    for _ in 0..options.samples {
+    for sample_index in 0..options.samples {
         fill_pattern(host.as_mut_slice(), SENTINEL_SEED);
         ze_fatal(
             copy_h2d_sync(
@@ -461,6 +473,10 @@ fn measure_direct(
         )?;
         verify_or_fail(host.as_slice(), PATTERN_SEED, &label)?;
         durations.push(elapsed);
+        events(ExecutionEvent::SamplingProgress {
+            completed: sample_index + 1,
+            total: options.samples,
+        });
     }
 
     Ok(durations)
@@ -573,7 +589,7 @@ fn measure_staged(
 
     let label = plan.label();
     let mut durations = Vec::with_capacity(sample_capacity(options.samples)?);
-    for _ in 0..options.samples {
+    for sample_index in 0..options.samples {
         fill_pattern(verify.as_mut_slice(), SENTINEL_SEED);
         ze_fatal(
             copy_h2d_sync(
@@ -610,6 +626,10 @@ fn measure_staged(
         )?;
         verify_or_fail(verify.as_slice(), PATTERN_SEED, &label)?;
         durations.push(elapsed);
+        events(ExecutionEvent::SamplingProgress {
+            completed: sample_index + 1,
+            total: options.samples,
+        });
     }
 
     Ok(durations)
@@ -642,6 +662,7 @@ mod tests {
         let mut events = |event| match event {
             ExecutionEvent::Warmup { .. } => seen.push("warmup"),
             ExecutionEvent::Sampling { .. } => seen.push("sampling"),
+            ExecutionEvent::SamplingProgress { .. } => seen.push("progress"),
             ExecutionEvent::Analysis => seen.push("analysis"),
         };
 

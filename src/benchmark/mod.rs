@@ -164,6 +164,13 @@ fn emit_execution_event(fanout: &mut EventFanout<'_>, id: &CaseId, event: Execut
                 estimated,
             });
         }
+        ExecutionEvent::SamplingProgress { completed, total } => {
+            fanout.emit(Event::SamplingProgress {
+                id,
+                completed,
+                total,
+            });
+        }
         ExecutionEvent::Analysis => {
             fanout.emit(Event::AnalysisStart { id });
         }

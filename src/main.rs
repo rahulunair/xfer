@@ -2,7 +2,7 @@ use std::error::Error;
 use std::io::{self, IsTerminal, Write};
 
 use xfer::cli::{self, CliAction, Command, OutputFormat};
-use xfer::output::{self, ColorMode, LiveReporter, StatusMode, TextOptions};
+use xfer::output::{self, ColorMode, InteractiveReporter, LiveReporter, StatusMode, TextOptions};
 
 fn main() {
     if let Err(error) = run() {
@@ -30,14 +30,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                 color: color_mode(options.format, stdout_is_terminal),
             };
             let status_mode = status_mode(options.format, stderr_is_terminal);
-            let reporter = LiveReporter::new(
-                io::stdout().lock(),
-                io::stderr().lock(),
-                options.format,
-                text_options,
-                status_mode,
-            );
-            let _report = xfer::benchmark::bench_with_reporter(&options, reporter)?;
+            let color = text_options.color;
+            if status_mode == StatusMode::Interactive {
+                let reporter = LiveReporter::new(
+                    io::stdout().lock(),
+                    io::sink(),
+                    options.format,
+                    text_options,
+                    StatusMode::Disabled,
+                );
+                let reporter = InteractiveReporter::new(reporter, color);
+                let _report = xfer::benchmark::bench_with_reporter(&options, reporter)?;
+            } else {
+                let reporter = LiveReporter::new(
+                    io::stdout().lock(),
+                    io::stderr().lock(),
+                    options.format,
+                    text_options,
+                    status_mode,
+                );
+                let _report = xfer::benchmark::bench_with_reporter(&options, reporter)?;
+            }
         }
     }
 

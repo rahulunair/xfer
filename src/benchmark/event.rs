@@ -43,6 +43,11 @@ pub enum BenchEvent<'a> {
         samples: u32,
         estimated: Option<Duration>,
     },
+    SamplingProgress {
+        id: &'a CaseId,
+        completed: u32,
+        total: u32,
+    },
     AnalysisStart {
         id: &'a CaseId,
     },
@@ -82,6 +87,10 @@ pub(crate) enum ExecutionEvent {
     Sampling {
         samples: u32,
         estimated: Option<Duration>,
+    },
+    SamplingProgress {
+        completed: u32,
+        total: u32,
     },
     Analysis,
 }
@@ -135,6 +144,7 @@ mod tests {
                         return Err(io::Error::other("closed"));
                     }
                     BenchEvent::SamplingStart { .. } => seen.push("sampling"),
+                    BenchEvent::SamplingProgress { .. } => seen.push("progress"),
                     BenchEvent::AnalysisStart { .. } => seen.push("analysis"),
                     BenchEvent::CaseComplete { .. }
                     | BenchEvent::CaseSkipped { .. }

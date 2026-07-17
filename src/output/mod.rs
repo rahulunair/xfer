@@ -12,7 +12,7 @@ pub use self::model::{
     AllocationKind, BenchCase, BenchReport, CaseOutcome, ColorMode, DeviceInfo, Endpoint, LinkInfo,
     ListReport, Operation, PeerAccess, PeerAccessInfo, QueueFlags, QueueGroupInfo, TextOptions,
 };
-pub use self::terminal::{LiveReporter, StatusMode};
+pub use self::terminal::{InteractiveReporter, LiveReporter, StatusMode};
 pub use self::text::{render_bench_text, render_case_text, render_list};
 
 pub fn render_bench(report: &BenchReport, format: OutputFormat, text: &TextOptions) -> String {
