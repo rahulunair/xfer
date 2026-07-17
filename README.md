@@ -47,11 +47,14 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The build script generates raw Rust bindings from the installed Level Zero
-header. To use a non-standard header location, set `LEVEL_ZERO_INCLUDE` to the
-directory containing the `level_zero` directory:
+header and uses `pkg-config` when available. For a non-standard installation,
+set `LEVEL_ZERO_INCLUDE` to the directory containing `level_zero` and
+`LEVEL_ZERO_LIB` to the loader library directory:
 
 ```sh
-LEVEL_ZERO_INCLUDE=/opt/level-zero/include cargo build --release
+LEVEL_ZERO_INCLUDE=/opt/level-zero/include \
+LEVEL_ZERO_LIB=/opt/level-zero/lib \
+cargo build --release
 ```
 
 ## Usage
