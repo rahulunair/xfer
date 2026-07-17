@@ -27,8 +27,8 @@ jobs:
       - run: cargo build --locked --release
       - name: Verify runtime dependencies
         run: |
-          ldd target/release/xefer
-          test "$(ldd target/release/xefer | grep -Ev 'linux-vdso|libze_loader\\.so\\.1|libgcc_s\\.so\\.1|libc\\.so\\.6|ld-linux' | wc -l)" -eq 0
+          readelf -d target/release/xefer | grep NEEDED
+          test "$(readelf -d target/release/xefer | grep NEEDED | grep -Ev 'libze_loader\\.so\\.1|libgcc_s\\.so\\.1|libc\\.so\\.6|ld-linux' | wc -l)" -eq 0
       - name: Package portable binary
         run: |
           install -Dm755 target/release/xefer dist/xefer
