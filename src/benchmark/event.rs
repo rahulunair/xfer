@@ -152,7 +152,7 @@ mod tests {
                 }
                 Ok(())
             };
-            let id = CaseId::new("h2d/dev0/1B/engine-0/wall-clock".to_owned());
+            let id = CaseId::new("h2d/dev0/1B/group-0/wall-clock/single-streams-1".to_owned());
             let mut fanout = EventFanout::new(&mut report);
 
             fanout.emit(BenchEvent::TopologyPlanned {

@@ -10,7 +10,8 @@ use crate::cli::OutputFormat;
 pub use self::csv::{BENCH_CSV_HEADER, csv_escape, render_bench_csv, render_case_csv};
 pub use self::model::{
     AllocationKind, BenchCase, BenchReport, CaseOutcome, ColorMode, DeviceInfo, Endpoint, LinkInfo,
-    ListReport, Operation, PeerAccess, PeerAccessInfo, QueueFlags, QueueGroupInfo, TextOptions,
+    ListReport, Operation, PeerAccess, PeerAccessInfo, QueueFlags, QueueGroupInfo, QueueStreamInfo,
+    TextOptions,
 };
 pub use self::terminal::{InteractiveReporter, LiveReporter, StatusMode};
 pub use self::text::{render_bench_text, render_case_text, render_list};

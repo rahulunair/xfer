@@ -1,6 +1,8 @@
-use super::model::{BenchCase, BenchReport, CaseOutcome, Endpoint, LinkInfo, Operation};
+use super::model::{
+    BenchCase, BenchReport, CaseOutcome, Endpoint, LinkInfo, Operation, QueueStreamInfo,
+};
 
-pub const BENCH_CSV_HEADER: &str = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_ordinal,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason";
+pub const BENCH_CSV_HEADER: &str = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_ordinal,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason,benchmark_mode,stream_count,queue_streams,second_phase_stream_count,second_phase_queue_streams,logical_payload_bytes,submitted_copy_bytes,submission_policy,staging_barrier";
 
 pub fn render_bench_csv(report: &BenchReport) -> String {
     let mut lines = Vec::with_capacity(report.cases.len() + 1);
@@ -33,9 +35,21 @@ pub fn render_case_csv(case: &BenchCase) -> String {
     fields.push(case.byte_count.to_string());
     fields.push(super::text::format_bytes(case.byte_count));
     fields.push(case.allocation.to_string());
-    fields.push(case.queue.ordinal.to_string());
-    fields.push(case.queue.flags.copy.to_string());
-    fields.push(case.queue.flags.compute.to_string());
+    fields.push(
+        case.selected_group
+            .as_ref()
+            .map_or_else(String::new, |group| group.ordinal.to_string()),
+    );
+    fields.push(
+        case.selected_group
+            .as_ref()
+            .map_or_else(String::new, |group| group.flags.copy.to_string()),
+    );
+    fields.push(
+        case.selected_group
+            .as_ref()
+            .map_or_else(String::new, |group| group.flags.compute.to_string()),
+    );
     fields.push(case.timing.to_string());
     fields.push(case.warmup.as_millis().to_string());
     fields.push(case.requested_samples.to_string());
@@ -61,12 +75,52 @@ pub fn render_case_csv(case: &BenchCase) -> String {
     }
 
     fields.push(skip_reason.to_owned());
+    fields.push(case.mode.to_string());
+    fields.push(case.streams.len().to_string());
+    fields.push(render_streams(&case.streams));
+    fields.push(case.second_phase_streams.len().to_string());
+    fields.push(render_streams(&case.second_phase_streams));
+    fields.push(case.byte_count.to_string());
+    fields.push(submitted_copy_bytes(case).to_string());
+    fields.push(submission_policy(case).to_owned());
+    fields.push(staging_barrier(case).to_owned());
 
     fields
         .into_iter()
         .map(|field| csv_escape(&field))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn render_streams(streams: &[QueueStreamInfo]) -> String {
+    streams
+        .iter()
+        .map(|stream| format!("g{}:q{}", stream.group_ordinal, stream.queue_index))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn submitted_copy_bytes(case: &BenchCase) -> u64 {
+    if matches!(case.operation, Operation::ExplicitStaged) {
+        case.byte_count.saturating_mul(2)
+    } else {
+        case.byte_count
+    }
+}
+
+fn submission_policy(case: &BenchCase) -> &'static str {
+    match case.mode {
+        crate::cli::BenchMode::Single => "submit-one-sync-one",
+        crate::cli::BenchMode::Saturation => "prepare-all-submit-all-sync-all",
+    }
+}
+
+fn staging_barrier(case: &BenchCase) -> &'static str {
+    if matches!(case.operation, Operation::ExplicitStaged) {
+        "after-d2h-all"
+    } else {
+        ""
+    }
 }
 
 pub fn csv_escape(value: &str) -> String {
@@ -153,19 +207,30 @@ mod tests {
         let summary = stats::summarize(&samples).expect("summary");
 
         BenchCase {
+            mode: crate::cli::BenchMode::Single,
+            selected_group: Some(QueueGroupInfo {
+                ordinal: 1,
+                flags: QueueFlags {
+                    copy: true,
+                    compute: false,
+                },
+                queue_count: 1,
+            }),
+            streams: vec![crate::output::QueueStreamInfo {
+                group_ordinal: 1,
+                queue_index: 0,
+                flags: QueueFlags {
+                    copy: true,
+                    compute: false,
+                },
+            }],
+            second_phase_streams: Vec::new(),
             transfer_class: TransferClass::D2H,
             operation: Operation::DeviceToHost,
             source: Endpoint::Device(0),
             destination: Endpoint::Host,
             byte_count: 256 * 1024 * 1024,
             allocation: AllocationKind::PinnedHost,
-            queue: QueueGroupInfo {
-                ordinal: 1,
-                flags: QueueFlags {
-                    copy: true,
-                    compute: false,
-                },
-            },
             timing: TimingMode::WallClock,
             warmup: Duration::from_secs(1),
             requested_samples: 5,
@@ -185,12 +250,18 @@ mod tests {
     #[test]
     fn csv_header_is_stable() {
         let columns = BENCH_CSV_HEADER.split(',').collect::<Vec<_>>();
+        let legacy = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_ordinal,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason"
+            .split(',')
+            .collect::<Vec<_>>();
 
-        assert_eq!(columns.len(), 28);
+        assert_eq!(columns.len(), 37);
+        assert_eq!(&columns[..legacy.len()], legacy);
         assert_eq!(columns[0], "status");
         assert_eq!(columns[1], "transfer_class");
         assert_eq!(columns[9], "queue_ordinal");
         assert_eq!(columns[27], "skip_reason");
+        assert_eq!(columns[28], "benchmark_mode");
+        assert_eq!(columns[36], "staging_barrier");
     }
 
     #[test]
@@ -217,7 +288,7 @@ mod tests {
             split_csv_record(lines[0]).len(),
             split_csv_record(lines[1]).len()
         );
-        assert_eq!(split_csv_record(lines[0]).len(), 28);
+        assert_eq!(split_csv_record(lines[0]).len(), 37);
         assert!(lines[1].contains("\"unknown:bad, \"\"quoted\"\" path\""));
         assert!(!csv.contains("\u{1b}["));
     }
@@ -226,6 +297,24 @@ mod tests {
     fn skipped_direct_csv_is_machine_readable() {
         let report = BenchReport {
             cases: vec![BenchCase {
+                mode: crate::cli::BenchMode::Single,
+                selected_group: Some(QueueGroupInfo {
+                    ordinal: 0,
+                    flags: QueueFlags {
+                        copy: true,
+                        compute: true,
+                    },
+                    queue_count: 1,
+                }),
+                streams: vec![crate::output::QueueStreamInfo {
+                    group_ordinal: 0,
+                    queue_index: 0,
+                    flags: QueueFlags {
+                        copy: true,
+                        compute: true,
+                    },
+                }],
+                second_phase_streams: Vec::new(),
                 transfer_class: TransferClass::D2DDirect,
                 operation: Operation::Direct {
                     peer_access: crate::output::PeerAccess::No,
@@ -234,13 +323,6 @@ mod tests {
                 destination: Endpoint::Device(1),
                 byte_count: 1024,
                 allocation: AllocationKind::Device,
-                queue: QueueGroupInfo {
-                    ordinal: 0,
-                    flags: QueueFlags {
-                        copy: true,
-                        compute: true,
-                    },
-                },
                 timing: TimingMode::DeviceTimestamps,
                 warmup: Duration::from_millis(250),
                 requested_samples: 10,
@@ -256,6 +338,53 @@ mod tests {
         let csv = render_bench_csv(&report);
         assert!(csv.contains("skipped,d2d-direct,direct,no,dev0,dev1"));
         assert!(csv.contains("peer access unsupported"));
+    }
+
+    #[test]
+    fn saturation_csv_reports_streams_and_logical_payload() {
+        let mut case = measured_case();
+        case.mode = crate::cli::BenchMode::Saturation;
+        case.selected_group = None;
+        case.streams.push(crate::output::QueueStreamInfo {
+            group_ordinal: 2,
+            queue_index: 0,
+            flags: QueueFlags {
+                copy: true,
+                compute: true,
+            },
+        });
+
+        let fields = split_csv_record(&render_case_csv(&case));
+
+        assert_eq!(fields[28], "saturation");
+        assert_eq!(fields[29], "2");
+        assert_eq!(fields[30], "g1:q0;g2:q0");
+        assert_eq!(fields[33], case.byte_count.to_string());
+        assert_eq!(fields[34], case.byte_count.to_string());
+        assert_eq!(fields[35], "prepare-all-submit-all-sync-all");
+        assert_eq!(fields[36], "");
+    }
+
+    #[test]
+    fn staged_saturation_csv_reports_both_phases_and_copy_traffic() {
+        let mut case = measured_case();
+        case.mode = crate::cli::BenchMode::Saturation;
+        case.operation = Operation::ExplicitStaged;
+        case.second_phase_streams = vec![crate::output::QueueStreamInfo {
+            group_ordinal: 3,
+            queue_index: 1,
+            flags: QueueFlags {
+                copy: true,
+                compute: false,
+            },
+        }];
+
+        let fields = split_csv_record(&render_case_csv(&case));
+
+        assert_eq!(fields[31], "1");
+        assert_eq!(fields[32], "g3:q1");
+        assert_eq!(fields[34], case.byte_count.saturating_mul(2).to_string());
+        assert_eq!(fields[36], "after-d2h-all");
     }
 
     fn split_csv_record(line: &str) -> Vec<String> {

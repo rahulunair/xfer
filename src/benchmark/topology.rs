@@ -56,6 +56,7 @@ pub(crate) fn discover_topology() -> Result<Topology> {
                             copy: queue.supports_copy(),
                             compute: queue.supports_compute(),
                         },
+                        queue_count: queue.num_queues,
                     },
                 })
                 .collect::<Vec<_>>();

@@ -43,7 +43,7 @@ impl<R> InteractiveReporter<R> {
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
         let sampling_style = ProgressStyle::with_template(sampling_template)
             .expect("static sampling template is valid")
-            .progress_chars("=> ");
+            .progress_chars("█▉▊▋▌▍▎▏  ");
         let complete_style = ProgressStyle::with_template(complete_template)
             .expect("static completion template is valid")
             .tick_strings(&["✓"]);
@@ -370,19 +370,30 @@ mod tests {
         let summary = stats::summarize(&samples).expect("summary");
 
         BenchCase {
+            mode: crate::cli::BenchMode::Single,
+            selected_group: Some(QueueGroupInfo {
+                ordinal: 2,
+                flags: QueueFlags {
+                    copy: true,
+                    compute: false,
+                },
+                queue_count: 1,
+            }),
+            streams: vec![crate::output::QueueStreamInfo {
+                group_ordinal: 2,
+                queue_index: 0,
+                flags: QueueFlags {
+                    copy: true,
+                    compute: false,
+                },
+            }],
+            second_phase_streams: Vec::new(),
             transfer_class: TransferClass::H2D,
             operation: Operation::HostToDevice,
             source: Endpoint::Host,
             destination: Endpoint::Device(0),
             byte_count: 1024,
             allocation: AllocationKind::PinnedHost,
-            queue: QueueGroupInfo {
-                ordinal: 2,
-                flags: QueueFlags {
-                    copy: true,
-                    compute: false,
-                },
-            },
             timing: TimingMode::WallClock,
             warmup: Duration::from_millis(10),
             requested_samples: 3,
@@ -399,7 +410,8 @@ mod tests {
 
     #[test]
     fn tty_status_overwrites_and_streams_text_cases() {
-        let id = CaseId::new("h2d/host-to-dev0/1KiB/engine-2/wall-clock".to_owned());
+        let id =
+            CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
         let case = measured_case();
         let mut reporter = LiveReporter::new(
             Vec::new(),
@@ -436,16 +448,17 @@ mod tests {
         let stdout = String::from_utf8(stdout).expect("stdout utf8");
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         assert!(stdout.starts_with("H2D pinned host -> dev0"));
-        assert!(stdout.contains("copy engine 2"));
+        assert!(stdout.contains("copy queue group 2"));
         assert!(stderr.contains("\r\u{1b}[2KTopology planned"));
-        assert!(stderr.contains("\r\u{1b}[2KBenchmarking H2D host -> dev0 / engine 2"));
+        assert!(stderr.contains("\r\u{1b}[2KBenchmarking H2D host -> dev0 / group 2"));
         assert!(stderr.ends_with("\r\u{1b}[2K"));
         assert!(!stderr.contains("ordinal"));
     }
 
     #[test]
     fn non_tty_status_uses_newline_lifecycle() {
-        let id = CaseId::new("h2d/host-to-dev0/1KiB/engine-2/wall-clock".to_owned());
+        let id =
+            CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
         let mut reporter = LiveReporter::new(
             Vec::new(),
             Vec::new(),
@@ -495,13 +508,14 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         assert_eq!(
             stderr,
-            "Topology planned: 1 devices, 1 cases\nBenchmarking H2D host -> dev0 / engine 2 (1/1)\nBenchmarking H2D host -> dev0 / engine 2: Warming up for 10 ms\nBenchmarking H2D host -> dev0 / engine 2: Collecting 3 samples in estimated 30 ms\nBenchmarking H2D host -> dev0 / engine 2: Analyzing\nComplete: 1 cases, 1 measured, 0 skipped\n"
+            "Topology planned: 1 devices, 1 cases\nBenchmarking H2D host -> dev0 / group 2 (1/1)\nBenchmarking H2D host -> dev0 / group 2: Warming up for 10 ms\nBenchmarking H2D host -> dev0 / group 2: Collecting 3 samples in estimated 30 ms\nBenchmarking H2D host -> dev0 / group 2: Analyzing\nComplete: 1 cases, 1 measured, 0 skipped\n"
         );
     }
 
     #[test]
     fn tty_sampling_progress_overwrites_with_verified_sample_count() {
-        let id = CaseId::new("h2d/host-to-dev0/1KiB/engine-2/wall-clock".to_owned());
+        let id =
+            CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
         let mut reporter = LiveReporter::new(
             Vec::new(),
             Vec::new(),
@@ -522,13 +536,14 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         assert_eq!(
             stderr,
-            "\r\u{1b}[2KBenchmarking H2D host -> dev0 / engine 2: Collecting [==========          ] 25/50 samples"
+            "\r\u{1b}[2KBenchmarking H2D host -> dev0 / group 2: Collecting [==========          ] 25/50 samples"
         );
     }
 
     #[test]
     fn csv_reporter_writes_one_header_rows_and_no_progress() {
-        let id = CaseId::new("h2d/host-to-dev0/1KiB/engine-2/wall-clock".to_owned());
+        let id =
+            CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
         let case = measured_case();
         let mut reporter = LiveReporter::new(
             Vec::new(),
@@ -576,7 +591,8 @@ mod tests {
 
     #[test]
     fn stdout_broken_pipe_is_reported_to_caller() {
-        let id = CaseId::new("h2d/host-to-dev0/1KiB/engine-2/wall-clock".to_owned());
+        let id =
+            CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
         let case = measured_case();
         let mut reporter = LiveReporter::new(
             BrokenPipeWriter,
@@ -597,7 +613,8 @@ mod tests {
 
     #[test]
     fn progress_broken_pipe_disables_status_without_failing_benchmark() {
-        let id = CaseId::new("h2d/host-to-dev0/1KiB/engine-2/wall-clock".to_owned());
+        let id =
+            CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
         let mut reporter = LiveReporter::new(
             Vec::new(),
             BrokenPipeWriter,

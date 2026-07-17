@@ -12,6 +12,7 @@ use super::error::{CaseExecutionError, ze_fatal};
 use super::event::ExecutionEvent;
 use super::plan::{CasePlan, ExecutionPlan, STAGED_DEVICE_TIMESTAMP_SKIP_REASON};
 use super::sampling::{estimate_collection, sample_capacity, warmup};
+use super::saturation;
 use super::topology::{DeviceRecord, Topology};
 use super::verify::{PATTERN_SEED, SENTINEL_SEED, fill_pattern, verify_or_fail};
 
@@ -25,6 +26,12 @@ pub(crate) fn execute_case(
     bytes: usize,
     events: &mut dyn FnMut(ExecutionEvent),
 ) -> std::result::Result<CaseOutcome, CaseExecutionError> {
+    if options.mode == crate::cli::BenchMode::Saturation {
+        let durations = saturation::measure_case(topology, plan, options, bytes, events)?;
+        events(ExecutionEvent::Analysis);
+        return analyze_durations(options.size_bytes, &durations, &plan.label());
+    }
+
     let durations = match plan.execution {
         ExecutionPlan::HostToDevice { device } => {
             measure_h2d(topology, plan, options, bytes, device, events)?
@@ -63,11 +70,11 @@ fn measure_h2d(
         .map_err(CaseExecutionError::Fatal)?;
     let context = ze_fatal(driver.create_context(), "create context")?;
     let queue = ze_fatal(
-        context.create_command_queue(&device.device, plan.queue.ordinal),
+        context.create_command_queue(&device.device, plan.single_group_ordinal()),
         "create command queue",
     )?;
     let list = ze_fatal(
-        context.create_command_list(&device.device, plan.queue.ordinal),
+        context.create_command_list(&device.device, plan.single_group_ordinal()),
         "create command list",
     )?;
     let mut source = ze_fatal(
@@ -163,11 +170,11 @@ fn measure_d2h(
         .map_err(CaseExecutionError::Fatal)?;
     let context = ze_fatal(driver.create_context(), "create context")?;
     let queue = ze_fatal(
-        context.create_command_queue(&device.device, plan.queue.ordinal),
+        context.create_command_queue(&device.device, plan.single_group_ordinal()),
         "create command queue",
     )?;
     let list = ze_fatal(
-        context.create_command_list(&device.device, plan.queue.ordinal),
+        context.create_command_list(&device.device, plan.single_group_ordinal()),
         "create command list",
     )?;
     let mut source = ze_fatal(
@@ -257,11 +264,11 @@ fn measure_same_device(
         .map_err(CaseExecutionError::Fatal)?;
     let context = ze_fatal(driver.create_context(), "create context")?;
     let queue = ze_fatal(
-        context.create_command_queue(&device.device, plan.queue.ordinal),
+        context.create_command_queue(&device.device, plan.single_group_ordinal()),
         "create command queue",
     )?;
     let list = ze_fatal(
-        context.create_command_list(&device.device, plan.queue.ordinal),
+        context.create_command_list(&device.device, plan.single_group_ordinal()),
         "create command list",
     )?;
     let mut host = ze_fatal(
@@ -369,19 +376,19 @@ fn measure_direct(
         .map_err(CaseExecutionError::Fatal)?;
     let context = ze_fatal(driver.create_context(), "create context")?;
     let source_queue = ze_fatal(
-        context.create_command_queue(&source.device, plan.queue.ordinal),
+        context.create_command_queue(&source.device, plan.single_group_ordinal()),
         "create source command queue",
     )?;
     let source_list = ze_fatal(
-        context.create_command_list(&source.device, plan.queue.ordinal),
+        context.create_command_list(&source.device, plan.single_group_ordinal()),
         "create source command list",
     )?;
     let destination_queue = ze_fatal(
-        context.create_command_queue(&destination.device, plan.queue.ordinal),
+        context.create_command_queue(&destination.device, plan.single_group_ordinal()),
         "create destination command queue",
     )?;
     let destination_list = ze_fatal(
-        context.create_command_list(&destination.device, plan.queue.ordinal),
+        context.create_command_list(&destination.device, plan.single_group_ordinal()),
         "create destination command list",
     )?;
     let mut host = ze_fatal(
@@ -507,19 +514,19 @@ fn measure_staged(
         .map_err(CaseExecutionError::Fatal)?;
     let context = ze_fatal(driver.create_context(), "create context")?;
     let source_queue = ze_fatal(
-        context.create_command_queue(&source.device, plan.queue.ordinal),
+        context.create_command_queue(&source.device, plan.single_group_ordinal()),
         "create source command queue",
     )?;
     let source_list = ze_fatal(
-        context.create_command_list(&source.device, plan.queue.ordinal),
+        context.create_command_list(&source.device, plan.single_group_ordinal()),
         "create source command list",
     )?;
     let destination_queue = ze_fatal(
-        context.create_command_queue(&destination.device, plan.queue.ordinal),
+        context.create_command_queue(&destination.device, plan.single_group_ordinal()),
         "create destination command queue",
     )?;
     let destination_list = ze_fatal(
-        context.create_command_list(&destination.device, plan.queue.ordinal),
+        context.create_command_list(&destination.device, plan.single_group_ordinal()),
         "create destination command list",
     )?;
     let mut host_source = ze_fatal(

@@ -44,6 +44,7 @@ pub struct BenchOptions {
     pub timing: TimingMode,
     pub format: OutputFormat,
     pub histogram: bool,
+    pub mode: BenchMode,
 }
 
 impl Default for BenchOptions {
@@ -59,7 +60,29 @@ impl Default for BenchOptions {
             timing: TimingMode::WallClock,
             format: OutputFormat::Text,
             histogram: true,
+            mode: BenchMode::Single,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BenchMode {
+    Single,
+    Saturation,
+}
+
+impl BenchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Saturation => "saturation",
+        }
+    }
+}
+
+impl fmt::Display for BenchMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -239,6 +262,11 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
             require_no_remaining(args, index, arg)?;
             return Ok(CliAction::Version);
         }
+        if arg == "-s" {
+            options.mode = BenchMode::Saturation;
+            index += 1;
+            continue;
+        }
 
         let ParsedOption { name, value } = parse_long_option(arg)?;
         match name {
@@ -254,7 +282,7 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
                 let value = take_option_value(args, &mut index, name, value)?;
                 options.transfer_class = Some(parse_transfer_class(&value)?);
             }
-            "--engine" | "--queue" | "--queue-ordinal" => {
+            "--queue-group" | "--engine" | "--queue" | "--queue-ordinal" => {
                 let value = take_option_value(args, &mut index, name, value)?;
                 options.queue_ordinal = Some(parse_u32(&value, name)?);
             }
@@ -286,6 +314,10 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
                 reject_option_value(name, value)?;
                 explicit_device_timestamps = true;
             }
+            "--saturation" => {
+                reject_option_value(name, value)?;
+                options.mode = BenchMode::Saturation;
+            }
             _ => {
                 return Err(CliError::new(format!(
                     "unknown option for 'bench': '{name}'\n\nRun '{PROGRAM_NAME} bench --help' for usage."
@@ -307,6 +339,11 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
     } else {
         explicit_timing.unwrap_or(TimingMode::WallClock)
     };
+    if options.mode == BenchMode::Saturation && options.timing == TimingMode::DeviceTimestamps {
+        return Err(CliError::new(
+            "saturation mode supports wall-clock timing only; cross-queue device timestamps do not form one aggregate interval",
+        ));
+    }
 
     Ok(CliAction::Command(Command::Bench(options)))
 }
@@ -524,7 +561,7 @@ Usage:
   xfer --version
 
 Commands:
-  list    Print Level Zero GPUs, engines, peer access, and PCIe links
+  list    Print Level Zero GPUs, queue groups, peer access, and PCIe links
   bench   Measure a useful transfer matrix, or a filtered subset
 
 Options:
@@ -536,7 +573,7 @@ const LIST_HELP: &str = "\
 Usage:
   xfer list
 
-Print Level Zero GPUs, copy engines, peer-access matrix, and negotiated PCIe
+Print Level Zero GPUs, queue groups, peer-access matrix, and negotiated PCIe
 link information.
 
 Options:
@@ -549,21 +586,23 @@ Usage:
   xfer bench [OPTIONS]
 
 With no options, xfer bench automatically runs a useful matrix for the
-available Level Zero GPUs and engines. Filters narrow that matrix; they do not
-silently select fallback devices, engines, timing modes, or transfer paths.
+available Level Zero GPUs and queue groups. Filters narrow that matrix; they do
+not silently select fallback devices, queue groups, timing modes, or paths.
 
 Options:
       --device N                  Select source/local device index
       --peer-device N             Select peer device index for cross-device cases
       --class CLASS               h2d, d2h, d2d-same-device, d2d-direct, d2d-staged
       --transfer-class CLASS      Alias for --class
-      --engine ID                 Select the engine shown by 'xfer list'
-      --queue ID                  Alias for --engine
+      --queue-group ID            Select the queue group shown by 'xfer list'
+      --engine ID                 Compatibility alias for --queue-group
+      --queue ID                  Compatibility alias for --queue-group
       --size BYTES                Allocation size, e.g. 268435456, 256MiB, 1GB
       --samples N                 Sample count, minimum 10; default 50
       --warmup DURATION           Warm-up duration, e.g. 500ms, 1s; default 1s
       --timing MODE               wall-clock or device-timestamps
       --device-timestamps         Alias for --timing device-timestamps
+  -s, --saturation               Divide one payload across selected queues concurrently
       --format FORMAT             text or csv; default text
       --no-histogram              Omit text histogram
   -h, --help                      Print help
@@ -646,6 +685,7 @@ mod tests {
                 timing: TimingMode::DeviceTimestamps,
                 format: OutputFormat::Csv,
                 histogram: false,
+                mode: BenchMode::Single,
             }))
         );
     }
@@ -661,6 +701,21 @@ mod tests {
         assert!(
             parse_err(&["bench", "--timing", "wall-clock", "--device-timestamps"])
                 .contains("conflicts")
+        );
+    }
+
+    #[test]
+    fn saturation_aliases_and_timing_conflict_are_explicit() {
+        for flag in ["-s", "--saturation"] {
+            let CliAction::Command(Command::Bench(options)) = parse_ok(&["bench", flag]) else {
+                panic!("expected bench command");
+            };
+            assert_eq!(options.mode, BenchMode::Saturation);
+        }
+
+        assert!(
+            parse_err(&["bench", "--saturation", "--device-timestamps"])
+                .contains("supports wall-clock timing only")
         );
     }
 

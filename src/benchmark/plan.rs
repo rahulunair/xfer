@@ -1,7 +1,7 @@
-use crate::cli::{BenchOptions, TimingMode, TransferClass};
+use crate::cli::{BenchMode, BenchOptions, TimingMode, TransferClass};
 use crate::output::{
     AllocationKind, BenchCase, CaseOutcome, Endpoint, LinkInfo, Operation, QueueFlags,
-    QueueGroupInfo,
+    QueueGroupInfo, QueueStreamInfo,
 };
 
 use super::error::{BenchmarkError, Result};
@@ -12,18 +12,22 @@ pub(crate) const STAGED_DEVICE_TIMESTAMP_SKIP_REASON: &str = "device timestamp t
 
 #[derive(Clone, Debug)]
 pub(crate) struct QueueSelection {
-    pub(crate) info: QueueGroupInfo,
+    pub(crate) selected_group: Option<QueueGroupInfo>,
+    pub(crate) streams: Vec<QueueStreamInfo>,
     pub(crate) skip_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct CasePlan {
+    pub(crate) mode: BenchMode,
+    pub(crate) selected_group: Option<QueueGroupInfo>,
+    pub(crate) streams: Vec<QueueStreamInfo>,
+    pub(crate) second_phase_streams: Vec<QueueStreamInfo>,
     pub(crate) transfer_class: TransferClass,
     pub(crate) operation: Operation,
     pub(crate) source: Endpoint,
     pub(crate) destination: Endpoint,
     pub(crate) allocation: AllocationKind,
-    pub(crate) queue: QueueGroupInfo,
     pub(crate) pcie_link: LinkInfo,
     pub(crate) execution: ExecutionPlan,
     pub(crate) skip_reasons: Vec<String>,
@@ -162,15 +166,21 @@ fn selected_peer_devices(
 }
 
 fn queue_selections(device: &DeviceRecord, options: &BenchOptions) -> Vec<QueueSelection> {
-    queue_selections_from_groups(
-        device.index,
-        &device
-            .queues
-            .iter()
-            .map(|queue| queue.info.clone())
-            .collect::<Vec<_>>(),
-        options.queue_ordinal,
-    )
+    let groups = device
+        .queues
+        .iter()
+        .map(|queue| queue.info.clone())
+        .collect::<Vec<_>>();
+    match options.mode {
+        BenchMode::Single => {
+            queue_selections_from_groups(device.index, &groups, options.queue_ordinal)
+        }
+        BenchMode::Saturation => vec![saturation_queue_selection(
+            device.index,
+            &groups,
+            options.queue_ordinal,
+        )],
+    }
 }
 
 fn queue_selections_from_groups(
@@ -178,19 +188,22 @@ fn queue_selections_from_groups(
     queues: &[QueueGroupInfo],
     queue_ordinal: Option<u32>,
 ) -> Vec<QueueSelection> {
-    if let Some(engine_id) = queue_ordinal {
-        return match queues.iter().find(|queue| queue.ordinal == engine_id) {
+    if let Some(group_ordinal) = queue_ordinal {
+        return match queues.iter().find(|queue| queue.ordinal == group_ordinal) {
             Some(queue) => vec![QueueSelection {
-                info: queue.clone(),
+                selected_group: Some(queue.clone()),
+                streams: queue_streams(queue, true),
                 skip_reason: None,
             }],
             None => vec![QueueSelection {
-                info: QueueGroupInfo {
-                    ordinal: engine_id,
+                selected_group: Some(QueueGroupInfo {
+                    ordinal: group_ordinal,
                     flags: QueueFlags::default(),
-                },
+                    queue_count: 0,
+                }),
+                streams: Vec::new(),
                 skip_reason: Some(format!(
-                    "dev{device_index} has no usable engine {engine_id}"
+                    "dev{device_index} has no usable queue group {group_ordinal}"
                 )),
             }],
         };
@@ -198,20 +211,75 @@ fn queue_selections_from_groups(
 
     if queues.is_empty() {
         vec![QueueSelection {
-            info: QueueGroupInfo {
+            selected_group: Some(QueueGroupInfo {
                 ordinal: 0,
                 flags: QueueFlags::default(),
-            },
+                queue_count: 0,
+            }),
+            streams: Vec::new(),
             skip_reason: Some(format!("dev{device_index} has no usable queue groups")),
         }]
     } else {
         queues
             .iter()
             .map(|queue| QueueSelection {
-                info: queue.clone(),
+                selected_group: Some(queue.clone()),
+                streams: queue_streams(queue, true),
                 skip_reason: None,
             })
             .collect()
+    }
+}
+
+fn saturation_queue_selection(
+    device_index: u32,
+    queues: &[QueueGroupInfo],
+    queue_ordinal: Option<u32>,
+) -> QueueSelection {
+    if let Some(group_ordinal) = queue_ordinal {
+        return queue_selections_from_groups(device_index, queues, Some(group_ordinal))
+            .into_iter()
+            .next()
+            .expect("queue selection always returns one result")
+            .with_all_group_streams();
+    }
+
+    let streams = queues
+        .iter()
+        .filter(|queue| queue.flags.copy)
+        .flat_map(|queue| queue_streams(queue, false))
+        .collect::<Vec<_>>();
+    let skip_reason = streams
+        .is_empty()
+        .then(|| format!("dev{device_index} has no queue groups advertising copy capability"));
+    QueueSelection {
+        selected_group: None,
+        streams,
+        skip_reason,
+    }
+}
+
+fn queue_streams(queue: &QueueGroupInfo, first_only: bool) -> Vec<QueueStreamInfo> {
+    let count = if first_only {
+        queue.queue_count.min(1)
+    } else {
+        queue.queue_count
+    };
+    (0..count)
+        .map(|queue_index| QueueStreamInfo {
+            group_ordinal: queue.ordinal,
+            queue_index,
+            flags: queue.flags,
+        })
+        .collect()
+}
+
+impl QueueSelection {
+    fn with_all_group_streams(mut self) -> Self {
+        if let Some(group) = &self.selected_group {
+            self.streams = queue_streams(group, false);
+        }
+        self
     }
 }
 
@@ -222,13 +290,17 @@ fn plan_h2d(topology: &Topology, options: &BenchOptions, device_index: usize) ->
         .map(|queue| {
             let mut reasons = common_skip_reasons(&queue);
             check_device_allocation_size(options.size_bytes, &[device], &mut reasons);
+            check_saturation_partition(options, &queue.streams, &mut reasons);
             CasePlan {
+                mode: options.mode,
+                selected_group: queue.selected_group,
+                streams: queue.streams,
+                second_phase_streams: Vec::new(),
                 transfer_class: TransferClass::H2D,
                 operation: Operation::HostToDevice,
                 source: Endpoint::Host,
                 destination: Endpoint::Device(device.index),
                 allocation: AllocationKind::PinnedHost,
-                queue: queue.info,
                 pcie_link: device.pcie_link.clone(),
                 execution: ExecutionPlan::HostToDevice {
                     device: device_index,
@@ -246,13 +318,17 @@ fn plan_d2h(topology: &Topology, options: &BenchOptions, device_index: usize) ->
         .map(|queue| {
             let mut reasons = common_skip_reasons(&queue);
             check_device_allocation_size(options.size_bytes, &[device], &mut reasons);
+            check_saturation_partition(options, &queue.streams, &mut reasons);
             CasePlan {
+                mode: options.mode,
+                selected_group: queue.selected_group,
+                streams: queue.streams,
+                second_phase_streams: Vec::new(),
                 transfer_class: TransferClass::D2H,
                 operation: Operation::DeviceToHost,
                 source: Endpoint::Device(device.index),
                 destination: Endpoint::Host,
                 allocation: AllocationKind::PinnedHost,
-                queue: queue.info,
                 pcie_link: device.pcie_link.clone(),
                 execution: ExecutionPlan::DeviceToHost {
                     device: device_index,
@@ -274,13 +350,17 @@ fn plan_same_device(
         .map(|queue| {
             let mut reasons = common_skip_reasons(&queue);
             check_device_allocation_size(options.size_bytes, &[device], &mut reasons);
+            check_saturation_partition(options, &queue.streams, &mut reasons);
             CasePlan {
+                mode: options.mode,
+                selected_group: queue.selected_group,
+                streams: queue.streams,
+                second_phase_streams: Vec::new(),
                 transfer_class: TransferClass::D2DSameDevice,
                 operation: Operation::SameDevice,
                 source: Endpoint::Device(device.index),
                 destination: Endpoint::Device(device.index),
                 allocation: AllocationKind::Device,
-                queue: queue.info,
                 pcie_link: LinkInfo::Unknown {
                     reason: "same-device transfer has no single negotiated PCIe link".to_owned(),
                 },
@@ -312,7 +392,28 @@ fn plan_cross_device(
                     &[source, destination],
                     &mut reasons,
                 );
-                require_destination_copy_queue(destination, queue.info.ordinal, &mut reasons);
+                check_saturation_partition(options, &queue.streams, &mut reasons);
+                if options.mode == BenchMode::Single {
+                    if let Some(group) = &queue.selected_group {
+                        require_destination_copy_queue(destination, group.ordinal, &mut reasons);
+                    }
+                }
+                let second_phase_streams = if class == TransferClass::D2DStaged {
+                    let destination_selection = destination_phase_selection(
+                        destination,
+                        options,
+                        queue.selected_group.as_ref(),
+                    );
+                    reasons.extend(common_skip_reasons(&destination_selection));
+                    check_saturation_partition(
+                        options,
+                        &destination_selection.streams,
+                        &mut reasons,
+                    );
+                    destination_selection.streams
+                } else {
+                    Vec::new()
+                };
 
                 let (operation, allocation, execution) = match class {
                     TransferClass::D2DDirect => {
@@ -359,12 +460,15 @@ fn plan_cross_device(
                 };
 
                 plans.push(CasePlan {
+                    mode: options.mode,
+                    selected_group: queue.selected_group,
+                    streams: queue.streams,
+                    second_phase_streams,
                     transfer_class: class,
                     operation,
                     source: Endpoint::Device(source.index),
                     destination: Endpoint::Device(destination.index),
                     allocation,
-                    queue: queue.info,
                     pcie_link: LinkInfo::Unknown {
                         reason: "cross-device transfer has no single negotiated PCIe link"
                             .to_owned(),
@@ -383,14 +487,51 @@ fn common_skip_reasons(queue: &QueueSelection) -> Vec<String> {
     let mut reasons = Vec::new();
     if let Some(reason) = &queue.skip_reason {
         reasons.push(reason.clone());
-    } else if !queue.info.flags.copy {
-        reasons.push(format!(
-            "engine {} does not advertise copy capability",
-            queue.info.ordinal
-        ));
+    } else if let Some(group) = &queue.selected_group {
+        if !group.flags.copy {
+            reasons.push(format!(
+                "queue group {} does not advertise copy capability",
+                group.ordinal
+            ));
+        }
+    } else if queue.streams.is_empty() {
+        reasons.push("no copy-capable queue streams selected".to_owned());
     }
 
     reasons
+}
+
+fn destination_phase_selection(
+    destination: &DeviceRecord,
+    options: &BenchOptions,
+    source_group: Option<&QueueGroupInfo>,
+) -> QueueSelection {
+    match options.mode {
+        BenchMode::Single => {
+            let ordinal = source_group.map(|group| group.ordinal);
+            queue_selections_from_groups(
+                destination.index,
+                &destination
+                    .queues
+                    .iter()
+                    .map(|queue| queue.info.clone())
+                    .collect::<Vec<_>>(),
+                ordinal,
+            )
+            .into_iter()
+            .next()
+            .expect("queue selection always returns one result")
+        }
+        BenchMode::Saturation => saturation_queue_selection(
+            destination.index,
+            &destination
+                .queues
+                .iter()
+                .map(|queue| queue.info.clone())
+                .collect::<Vec<_>>(),
+            options.queue_ordinal,
+        ),
+    }
 }
 
 fn check_device_allocation_size(bytes: u64, devices: &[&DeviceRecord], reasons: &mut Vec<String>) {
@@ -404,25 +545,48 @@ fn check_device_allocation_size(bytes: u64, devices: &[&DeviceRecord], reasons: 
     }
 }
 
-fn require_destination_copy_queue(
-    destination: &DeviceRecord,
-    engine_id: u32,
+fn check_saturation_partition(
+    options: &BenchOptions,
+    streams: &[QueueStreamInfo],
     reasons: &mut Vec<String>,
 ) {
+    if options.mode == BenchMode::Saturation
+        && !streams.is_empty()
+        && options.size_bytes < streams.len() as u64
+    {
+        reasons.push(format!(
+            "requested {} bytes cannot be divided into {} non-empty queue-stream regions",
+            options.size_bytes,
+            streams.len()
+        ));
+    }
+}
+
+fn require_destination_copy_queue<'device>(
+    destination: &'device DeviceRecord,
+    group_ordinal: u32,
+    reasons: &mut Vec<String>,
+) -> Option<&'device QueueRecord> {
     match destination
         .queues
         .iter()
-        .find(|queue| queue.info.ordinal == engine_id)
+        .find(|queue| queue.info.ordinal == group_ordinal)
     {
-        Some(queue) if queue.info.flags.copy => {}
-        Some(_) => reasons.push(format!(
-            "destination dev{} engine {engine_id} does not advertise copy capability",
-            destination.index
-        )),
-        None => reasons.push(format!(
-            "destination dev{} has no usable engine {engine_id}",
-            destination.index
-        )),
+        Some(queue) if queue.info.flags.copy => Some(queue),
+        Some(_) => {
+            reasons.push(format!(
+                "destination dev{} queue group {group_ordinal} does not advertise copy capability",
+                destination.index
+            ));
+            None
+        }
+        None => {
+            reasons.push(format!(
+                "destination dev{} has no usable queue group {group_ordinal}",
+                destination.index
+            ));
+            None
+        }
     }
 }
 
@@ -437,13 +601,16 @@ pub(crate) fn joined_skip_reasons(reasons: &[String]) -> Option<String> {
 impl CasePlan {
     pub(crate) fn into_case(self, options: &BenchOptions, outcome: CaseOutcome) -> BenchCase {
         BenchCase {
+            mode: self.mode,
+            selected_group: self.selected_group,
+            streams: self.streams,
+            second_phase_streams: self.second_phase_streams,
             transfer_class: self.transfer_class,
             operation: self.operation,
             source: self.source,
             destination: self.destination,
             byte_count: options.size_bytes,
             allocation: self.allocation,
-            queue: self.queue,
             timing: options.timing,
             warmup: options.warmup,
             requested_samples: options.samples,
@@ -453,21 +620,37 @@ impl CasePlan {
     }
 
     pub(crate) fn label(&self) -> String {
+        let queues = self.selected_group.as_ref().map_or_else(
+            || "all copy queue groups".to_owned(),
+            |group| format!("queue group {}", group.ordinal),
+        );
         format!(
-            "{} {} -> {} queue {}",
-            self.transfer_class, self.source, self.destination, self.queue.ordinal
+            "{} {} -> {} {queues}",
+            self.transfer_class, self.source, self.destination
         )
     }
 
+    pub(crate) fn single_group_ordinal(&self) -> u32 {
+        self.selected_group
+            .as_ref()
+            .expect("single-transfer plans always select one queue group")
+            .ordinal
+    }
+
     pub(crate) fn case_id(&self, options: &BenchOptions) -> CaseId {
+        let queue_scope = self.selected_group.as_ref().map_or_else(
+            || "all-copy-groups".to_owned(),
+            |group| format!("group-{}", group.ordinal),
+        );
         CaseId::new(format!(
-            "{}/{}-to-{}/{}/engine-{}/{}",
+            "{}/{}-to-{}/{}/{queue_scope}/{}/{}-streams-{}",
             self.transfer_class,
             self.source,
             self.destination,
             format_case_size(options.size_bytes),
-            self.queue.ordinal,
-            options.timing
+            options.timing,
+            self.mode,
+            self.streams.len()
         ))
     }
 }
@@ -503,6 +686,7 @@ mod tests {
         QueueGroupInfo {
             ordinal,
             flags: QueueFlags { copy, compute },
+            queue_count: 1,
         }
     }
 
@@ -520,22 +704,68 @@ mod tests {
         let selections = queue_selections_from_groups(7, &[queue(1, true, false)], Some(3));
 
         assert_eq!(selections.len(), 1);
-        assert_eq!(selections[0].info.ordinal, 3);
+        assert_eq!(
+            selections[0]
+                .selected_group
+                .as_ref()
+                .map(|group| group.ordinal),
+            Some(3)
+        );
         assert_eq!(
             selections[0].skip_reason.as_deref(),
-            Some("dev7 has no usable engine 3")
+            Some("dev7 has no usable queue group 3")
+        );
+    }
+
+    #[test]
+    fn saturation_selects_every_queue_in_copy_capable_groups() {
+        let groups = [
+            QueueGroupInfo {
+                queue_count: 2,
+                ..queue(0, true, true)
+            },
+            QueueGroupInfo {
+                queue_count: 3,
+                ..queue(1, false, true)
+            },
+            QueueGroupInfo {
+                queue_count: 2,
+                ..queue(2, true, false)
+            },
+        ];
+
+        let selection = saturation_queue_selection(0, &groups, None);
+
+        assert!(selection.selected_group.is_none());
+        assert_eq!(
+            selection
+                .streams
+                .iter()
+                .map(|stream| (stream.group_ordinal, stream.queue_index))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 1), (2, 0), (2, 1)]
         );
     }
 
     #[test]
     fn case_id_uses_display_label_terms() {
         let plan = CasePlan {
+            mode: BenchMode::Single,
+            selected_group: Some(queue(2, true, false)),
+            streams: vec![QueueStreamInfo {
+                group_ordinal: 2,
+                queue_index: 0,
+                flags: QueueFlags {
+                    copy: true,
+                    compute: false,
+                },
+            }],
+            second_phase_streams: Vec::new(),
             transfer_class: TransferClass::H2D,
             operation: Operation::HostToDevice,
             source: Endpoint::Host,
             destination: Endpoint::Device(0),
             allocation: AllocationKind::PinnedHost,
-            queue: queue(2, true, false),
             pcie_link: LinkInfo::Unknown {
                 reason: "test".to_owned(),
             },
@@ -549,7 +779,7 @@ mod tests {
 
         assert_eq!(
             plan.case_id(&options).as_str(),
-            "h2d/host-to-dev0/256MiB/engine-2/wall-clock"
+            "h2d/host-to-dev0/256MiB/group-2/wall-clock/single-streams-1"
         );
     }
 }

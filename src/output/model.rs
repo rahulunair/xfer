@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::cli::{TimingMode, TransferClass};
+use crate::cli::{BenchMode, TimingMode, TransferClass};
 use crate::stats::Summary;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +43,14 @@ pub struct DeviceInfo {
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueueGroupInfo {
     pub ordinal: u32,
+    pub flags: QueueFlags,
+    pub queue_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueStreamInfo {
+    pub group_ordinal: u32,
+    pub queue_index: u32,
     pub flags: QueueFlags,
 }
 
@@ -95,13 +103,16 @@ pub struct BenchReport {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BenchCase {
+    pub mode: BenchMode,
+    pub selected_group: Option<QueueGroupInfo>,
+    pub streams: Vec<QueueStreamInfo>,
+    pub second_phase_streams: Vec<QueueStreamInfo>,
     pub transfer_class: TransferClass,
     pub operation: Operation,
     pub source: Endpoint,
     pub destination: Endpoint,
     pub byte_count: u64,
     pub allocation: AllocationKind,
-    pub queue: QueueGroupInfo,
     pub timing: TimingMode,
     pub warmup: Duration,
     pub requested_samples: u32,

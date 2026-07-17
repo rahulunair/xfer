@@ -17,6 +17,7 @@ mod event;
 mod execute;
 mod plan;
 mod sampling;
+mod saturation;
 mod topology;
 mod verify;
 
@@ -144,12 +145,21 @@ where
 
 fn validate_options(options: &BenchOptions) -> Result<()> {
     if options.samples < MIN_SAMPLES {
-        Err(BenchmarkError::InvalidFilter(format!(
+        return Err(BenchmarkError::InvalidFilter(format!(
             "sample count must be at least {MIN_SAMPLES}"
-        )))
-    } else {
-        Ok(())
+        )));
     }
+
+    if options.mode == crate::cli::BenchMode::Saturation
+        && options.timing == crate::cli::TimingMode::DeviceTimestamps
+    {
+        return Err(BenchmarkError::InvalidFilter(
+            "saturation mode supports wall-clock timing only because independent queues do not share one aggregate device-timestamp interval"
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn emit_execution_event(fanout: &mut EventFanout<'_>, id: &CaseId, event: ExecutionEvent) {
@@ -205,6 +215,21 @@ mod tests {
             validate_options(&options),
             Err(BenchmarkError::InvalidFilter(message))
                 if message == "sample count must be at least 10"
+        ));
+    }
+
+    #[test]
+    fn library_api_rejects_saturation_device_timestamps() {
+        let options = BenchOptions {
+            mode: crate::cli::BenchMode::Saturation,
+            timing: crate::cli::TimingMode::DeviceTimestamps,
+            ..BenchOptions::default()
+        };
+
+        assert!(matches!(
+            validate_options(&options),
+            Err(BenchmarkError::InvalidFilter(message))
+                if message.contains("supports wall-clock timing only")
         ));
     }
 }

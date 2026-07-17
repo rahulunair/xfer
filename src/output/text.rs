@@ -1,6 +1,6 @@
 use super::model::{
     BenchCase, BenchReport, CaseOutcome, ColorMode, LinkInfo, ListReport, Operation, PeerAccess,
-    QueueFlags, TextOptions,
+    QueueFlags, QueueStreamInfo, TextOptions,
 };
 use crate::cli::TransferClass;
 use crate::histogram::Histogram;
@@ -26,9 +26,10 @@ pub fn render_list(report: &ListReport) -> String {
 
         for queue in &device.queue_groups {
             lines.push(format!(
-                "  engine {} ({})",
+                "  queue group {} ({}, {})",
                 queue.ordinal,
-                render_engine_flags(queue.flags)
+                render_queue_flags(queue.flags),
+                render_queue_count(queue.queue_count)
             ));
         }
     }
@@ -81,10 +82,13 @@ pub(crate) fn status_label_from_case_id(id: &str) -> String {
     let class = parts.next().unwrap_or_default();
     let endpoints = parts.next().unwrap_or_default();
     let _size = parts.next();
-    let engine = parts
+    let queue_scope = parts
         .next()
-        .and_then(|part| part.strip_prefix("engine-"))
-        .map(|id| format!(" / engine {id}"))
+        .map(|part| match part.strip_prefix("group-") {
+            Some(id) => format!(" / group {id}"),
+            None if part == "all-copy-groups" => " / all copy groups".to_owned(),
+            None => String::new(),
+        })
         .unwrap_or_default();
     let class = match class {
         "h2d" => "H2D".to_owned(),
@@ -100,9 +104,9 @@ pub(crate) fn status_label_from_case_id(id: &str) -> String {
     );
 
     if endpoints.is_empty() {
-        format!("{class}{engine}")
+        format!("{class}{queue_scope}")
     } else {
-        format!("{class} {endpoints}{engine}")
+        format!("{class} {endpoints}{queue_scope}")
     }
 }
 
@@ -144,20 +148,52 @@ fn render_case_lines(case: &BenchCase, options: &TextOptions) -> Vec<String> {
     let mut lines = Vec::new();
     let label = case_label(case);
     lines.push(paint(options.color, "\u{1b}[1m", &label));
+    let execution = match case.mode {
+        crate::cli::BenchMode::Single => case.selected_group.as_ref().map_or_else(
+            || format_bytes(case.byte_count),
+            |group| {
+                format!(
+                    "{} on {} queue group {}",
+                    format_bytes(case.byte_count),
+                    render_queue_flags(group.flags),
+                    group.ordinal
+                )
+            },
+        ),
+        crate::cli::BenchMode::Saturation => format!(
+            "{} total across {} queue streams",
+            format_bytes(case.byte_count),
+            case.streams.len()
+        ),
+    };
     lines.push(format!(
-        "  {} on {} engine {}  [{}, {} samples, {} warm-up]",
-        format_bytes(case.byte_count),
-        render_engine_flags(case.queue.flags),
-        case.queue.ordinal,
+        "  {execution}  [{}, {} samples, {} warm-up]",
         render_timing(case.timing),
         case.requested_samples,
         format_duration(case.warmup)
     ));
     lines.push(format!("  {}", render_link_inline(&case.pcie_link)));
     lines.push(format!(
-        "  config      class={} allocation={} bytes={} engine={}",
-        case.transfer_class, case.allocation, case.byte_count, case.queue.ordinal
+        "  config      mode={} class={} allocation={} bytes={} streams={}",
+        case.mode,
+        case.transfer_class,
+        case.allocation,
+        case.byte_count,
+        render_streams(&case.streams)
     ));
+    if !case.second_phase_streams.is_empty() {
+        lines.push(format!(
+            "  phase 2     streams={}; barrier=after-phase-1-all",
+            render_streams(&case.second_phase_streams)
+        ));
+    }
+    if case.mode == crate::cli::BenchMode::Saturation {
+        lines.push(format!(
+            "  traffic     {} logical payload; {} submitted copy bytes",
+            format_bytes(case.byte_count),
+            format_bytes(submitted_copy_bytes(case))
+        ));
+    }
 
     if let Operation::Direct { peer_access } = &case.operation {
         lines.push(format!(
@@ -370,12 +406,36 @@ fn render_timing(timing: crate::cli::TimingMode) -> &'static str {
     }
 }
 
-fn render_engine_flags(flags: QueueFlags) -> &'static str {
+fn render_queue_flags(flags: QueueFlags) -> &'static str {
     match (flags.copy, flags.compute) {
         (true, true) => "compute+copy",
         (true, false) => "copy",
         (false, true) => "compute",
         (false, false) => "no-copy-no-compute",
+    }
+}
+
+fn render_queue_count(count: u32) -> String {
+    if count == 1 {
+        "1 queue".to_owned()
+    } else {
+        format!("{count} queues")
+    }
+}
+
+fn render_streams(streams: &[QueueStreamInfo]) -> String {
+    streams
+        .iter()
+        .map(|stream| format!("g{}:q{}", stream.group_ordinal, stream.queue_index))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn submitted_copy_bytes(case: &BenchCase) -> u64 {
+    if matches!(case.operation, Operation::ExplicitStaged) {
+        case.byte_count.saturating_mul(2)
+    } else {
+        case.byte_count
     }
 }
 
@@ -539,19 +599,30 @@ mod tests {
         let summary = stats::summarize(&samples).expect("summary");
 
         BenchCase {
+            mode: crate::cli::BenchMode::Single,
+            selected_group: Some(QueueGroupInfo {
+                ordinal: 1,
+                flags: QueueFlags {
+                    copy: true,
+                    compute: false,
+                },
+                queue_count: 1,
+            }),
+            streams: vec![crate::output::QueueStreamInfo {
+                group_ordinal: 1,
+                queue_index: 0,
+                flags: QueueFlags {
+                    copy: true,
+                    compute: false,
+                },
+            }],
+            second_phase_streams: Vec::new(),
             transfer_class: TransferClass::D2H,
             operation: Operation::DeviceToHost,
             source: Endpoint::Device(0),
             destination: Endpoint::Host,
             byte_count: 256 * 1024 * 1024,
             allocation: AllocationKind::PinnedHost,
-            queue: QueueGroupInfo {
-                ordinal: 1,
-                flags: QueueFlags {
-                    copy: true,
-                    compute: false,
-                },
-            },
             timing: TimingMode::WallClock,
             warmup: Duration::from_secs(1),
             requested_samples: 5,
@@ -580,7 +651,9 @@ mod tests {
         let output = render_bench_text(&report, &TextOptions::default());
 
         assert!(output.contains("D2H dev0 -> pinned host"));
-        assert!(output.contains("256 MiB on copy engine 1  [wall clock, 5 samples, 1 s warm-up]"));
+        assert!(
+            output.contains("256 MiB on copy queue group 1  [wall clock, 5 samples, 1 s warm-up]")
+        );
         assert!(output.contains("negotiated PCIe Gen5 x16, 63 GB/s theoretical"));
         assert!(output.contains("time"));
         assert!(output.contains("throughput"));
@@ -714,6 +787,24 @@ mod tests {
     fn skipped_direct_text_separates_observation_peer_access_and_path_inference() {
         let report = BenchReport {
             cases: vec![BenchCase {
+                mode: crate::cli::BenchMode::Single,
+                selected_group: Some(QueueGroupInfo {
+                    ordinal: 0,
+                    flags: QueueFlags {
+                        copy: true,
+                        compute: true,
+                    },
+                    queue_count: 1,
+                }),
+                streams: vec![crate::output::QueueStreamInfo {
+                    group_ordinal: 0,
+                    queue_index: 0,
+                    flags: QueueFlags {
+                        copy: true,
+                        compute: true,
+                    },
+                }],
+                second_phase_streams: Vec::new(),
                 transfer_class: TransferClass::D2DDirect,
                 operation: Operation::Direct {
                     peer_access: PeerAccess::No,
@@ -722,13 +813,6 @@ mod tests {
                 destination: Endpoint::Device(1),
                 byte_count: 1024,
                 allocation: AllocationKind::Device,
-                queue: QueueGroupInfo {
-                    ordinal: 0,
-                    flags: QueueFlags {
-                        copy: true,
-                        compute: true,
-                    },
-                },
                 timing: TimingMode::DeviceTimestamps,
                 warmup: Duration::from_millis(250),
                 requested_samples: 10,
@@ -745,7 +829,7 @@ mod tests {
 
         let text = render_bench_text(&report, &TextOptions::default());
         assert!(text.contains("D2D direct dev0 -> dev1"));
-        assert!(text.contains("compute+copy engine 0"));
+        assert!(text.contains("compute+copy queue group 0"));
         assert!(text.contains("direct Level Zero copy"));
         assert!(text.contains("peer access no"));
         assert!(text.contains("physical route not inferred"));
@@ -754,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_list_text_with_engine_names() {
+    fn renders_list_text_with_queue_group_names() {
         let report = ListReport {
             devices: vec![DeviceInfo {
                 index: 0,
@@ -771,6 +855,7 @@ mod tests {
                         copy: true,
                         compute: false,
                     },
+                    queue_count: 1,
                 }],
             }],
             peer_access: vec![PeerAccessInfo {
@@ -782,7 +867,7 @@ mod tests {
 
         let text = render_list(&report);
         assert!(text.contains("dev0  Intel GPU"));
-        assert!(text.contains("engine 1 (copy)"));
+        assert!(text.contains("queue group 1 (copy, 1 queue)"));
         assert!(text.contains("dev0 -> dev1  yes"));
         assert!(!text.contains("ordinal"));
     }
@@ -790,8 +875,10 @@ mod tests {
     #[test]
     fn status_label_is_compact_and_avoids_queue_terms() {
         assert_eq!(
-            status_label_from_case_id("d2d-direct/dev0-to-dev1/256MiB/engine-2/wall-clock"),
-            "D2D direct dev0 -> dev1 / engine 2"
+            status_label_from_case_id(
+                "d2d-direct/dev0-to-dev1/256MiB/group-2/wall-clock/single-streams-1"
+            ),
+            "D2D direct dev0 -> dev1 / group 2"
         );
     }
 }
