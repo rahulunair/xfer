@@ -59,7 +59,8 @@ cargo build --release
 
 ## Usage
 
-List GPUs, copy engines, peer-access capability, and negotiated PCIe links:
+List GPUs, queue groups, queue counts, peer-access capability, and negotiated
+PCIe links:
 
 ```sh
 xfer list
@@ -71,10 +72,18 @@ Run the default useful transfer matrix:
 xfer bench
 ```
 
-Select a transfer and engine explicitly:
+Select a transfer and queue group explicitly:
 
 ```sh
-xfer bench --device 0 --class h2d --engine 1 --size 256MiB --samples 50
+xfer bench --device 0 --class h2d --queue-group 1 --size 256MiB --samples 50
+```
+
+Measure aggregate saturation across all copy-capable queue streams:
+
+```sh
+xfer bench --saturation
+xfer bench -s --device 0 --class d2d-same-device
+xfer bench -s --queue-group 1
 ```
 
 Produce stable machine-readable output:
@@ -83,9 +92,13 @@ Produce stable machine-readable output:
 xfer bench --format csv --no-histogram
 ```
 
-Device, engine, transfer-class, size, and sample controls are advanced
+Device, queue-group, transfer-class, size, and sample controls are advanced
 overrides. Use `xfer --help` or `xfer bench --help` for the complete
 interface.
+
+See [HOW_IT_WORKS.md](HOW_IT_WORKS.md) for the exact timed intervals,
+saturation payload accounting, statistical definitions, queue terminology,
+and comparison conditions for Intel's `ze_peer`.
 
 ## Timing and interpretation
 
