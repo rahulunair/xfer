@@ -526,17 +526,18 @@ impl<'driver> Context<'driver> {
     }
 
     fn destroy(&mut self) -> Result<()> {
-        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
-        if handle.is_null() {
+        if self.handle.is_null() {
             return Ok(());
         }
         self.state.require_release_safe("zeContextDestroy")?;
 
         let result = unsafe {
-            // SAFETY: handle is the owned context handle and this wrapper attempts release only once.
-            raw::zeContextDestroy(handle)
+            // SAFETY: self.handle is the owned context handle and remains owned until release succeeds.
+            raw::zeContextDestroy(self.handle)
         };
-        check("zeContextDestroy", result)
+        check("zeContextDestroy", result)?;
+        self.handle = ptr::null_mut();
+        Ok(())
     }
 }
 
@@ -669,18 +670,19 @@ impl<'context> CommandQueue<'context> {
     }
 
     fn destroy(&mut self) -> Result<()> {
-        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
-        if handle.is_null() {
+        if self.handle.is_null() {
             return Ok(());
         }
         self.context_state
             .require_release_safe("zeCommandQueueDestroy")?;
 
         let result = unsafe {
-            // SAFETY: handle is the owned queue handle and this wrapper attempts release only once.
-            raw::zeCommandQueueDestroy(handle)
+            // SAFETY: self.handle is the owned queue handle and remains owned until release succeeds.
+            raw::zeCommandQueueDestroy(self.handle)
         };
-        check("zeCommandQueueDestroy", result)
+        check("zeCommandQueueDestroy", result)?;
+        self.handle = ptr::null_mut();
+        Ok(())
     }
 }
 
@@ -1047,18 +1049,19 @@ impl<'context> CommandList<'context> {
     }
 
     fn destroy_inner(&mut self) -> Result<()> {
-        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
-        if handle.is_null() {
+        if self.handle.is_null() {
             return Ok(());
         }
         self.context_state
             .require_release_safe("zeCommandListDestroy")?;
 
         let result = unsafe {
-            // SAFETY: handle is the owned command-list handle and release is attempted only once.
-            raw::zeCommandListDestroy(handle)
+            // SAFETY: self.handle is the owned command-list handle and remains owned until release succeeds.
+            raw::zeCommandListDestroy(self.handle)
         };
-        check("zeCommandListDestroy", result)
+        check("zeCommandListDestroy", result)?;
+        self.handle = ptr::null_mut();
+        Ok(())
     }
 }
 
@@ -1158,16 +1161,18 @@ impl<'context> HostAllocation<'context> {
     }
 
     fn free_inner(&mut self) -> Result<()> {
-        let Some(ptr) = self.ptr.take() else {
+        let Some(ptr) = self.ptr else {
             return Ok(());
         };
         self.context_state.require_release_safe("zeMemFree(host)")?;
 
         let result = unsafe {
-            // SAFETY: ptr is the owned allocation and this wrapper attempts release only once.
+            // SAFETY: ptr is the owned allocation and remains owned until release succeeds.
             raw::zeMemFree(self.context, ptr.as_ptr())
         };
-        check("zeMemFree(host)", result)
+        check("zeMemFree(host)", result)?;
+        self.ptr = None;
+        Ok(())
     }
 }
 
@@ -1252,17 +1257,19 @@ impl<'context> DeviceAllocation<'context> {
     }
 
     fn free_inner(&mut self) -> Result<()> {
-        let Some(ptr) = self.ptr.take() else {
+        let Some(ptr) = self.ptr else {
             return Ok(());
         };
         self.context_state
             .require_release_safe("zeMemFree(device)")?;
 
         let result = unsafe {
-            // SAFETY: ptr is the owned allocation and this wrapper attempts release only once.
+            // SAFETY: ptr is the owned allocation and remains owned until release succeeds.
             raw::zeMemFree(self.context, ptr.as_ptr())
         };
-        check("zeMemFree(device)", result)
+        check("zeMemFree(device)", result)?;
+        self.ptr = None;
+        Ok(())
     }
 }
 
@@ -1389,18 +1396,19 @@ impl<'context> EventPool<'context> {
     }
 
     fn destroy_inner(&mut self) -> Result<()> {
-        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
-        if handle.is_null() {
+        if self.handle.is_null() {
             return Ok(());
         }
         self.context_state
             .require_release_safe("zeEventPoolDestroy")?;
 
         let result = unsafe {
-            // SAFETY: handle is the owned event-pool handle and release is attempted only once.
-            raw::zeEventPoolDestroy(handle)
+            // SAFETY: self.handle is the owned event-pool handle and remains owned until release succeeds.
+            raw::zeEventPoolDestroy(self.handle)
         };
-        check("zeEventPoolDestroy", result)
+        check("zeEventPoolDestroy", result)?;
+        self.handle = ptr::null_mut();
+        Ok(())
     }
 }
 
@@ -1466,17 +1474,18 @@ impl Event<'_> {
     }
 
     fn destroy_inner(&mut self) -> Result<()> {
-        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
-        if handle.is_null() {
+        if self.handle.is_null() {
             return Ok(());
         }
         self.context_state.require_release_safe("zeEventDestroy")?;
 
         let result = unsafe {
-            // SAFETY: handle is the owned event handle and release is attempted only once.
-            raw::zeEventDestroy(handle)
+            // SAFETY: self.handle is the owned event handle and remains owned until release succeeds.
+            raw::zeEventDestroy(self.handle)
         };
-        check("zeEventDestroy", result)
+        check("zeEventDestroy", result)?;
+        self.handle = ptr::null_mut();
+        Ok(())
     }
 }
 
@@ -1786,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_cleanup_state_abandons_allocation_without_retry() {
+    fn unsafe_cleanup_state_retains_allocation_for_retry() {
         let state = Rc::new(ContextState::default());
         state.poison();
         let mut allocation = HostAllocation {
@@ -1801,7 +1810,11 @@ mod tests {
             allocation.free_inner(),
             Err(LevelZeroError::SubmissionStateUnknown { .. })
         ));
-        assert!(allocation.ptr.is_none());
-        assert_eq!(allocation.free_inner(), Ok(()));
+        assert!(allocation.ptr.is_some());
+        assert!(matches!(
+            allocation.free_inner(),
+            Err(LevelZeroError::SubmissionStateUnknown { .. })
+        ));
+        allocation.ptr = None;
     }
 }

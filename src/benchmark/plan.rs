@@ -6,7 +6,7 @@ use crate::output::{
 
 use super::error::{BenchmarkError, Result};
 use super::event::CaseId;
-use super::topology::{DeviceRecord, QueueRecord, Topology};
+use super::topology::{DeviceRecord, Topology};
 
 pub(crate) const STAGED_DEVICE_TIMESTAMP_SKIP_REASON: &str = "device timestamp timing for explicit staged transfers is unsupported because the D2H and H2D legs can run on different device clock domains and cannot form one end-to-end device-time sample";
 
@@ -23,6 +23,7 @@ pub(crate) struct CasePlan {
     pub(crate) selected_group: Option<QueueGroupInfo>,
     pub(crate) streams: Vec<QueueStreamInfo>,
     pub(crate) second_phase_streams: Vec<QueueStreamInfo>,
+    pub(crate) verification_stream: Option<QueueStreamInfo>,
     pub(crate) transfer_class: TransferClass,
     pub(crate) operation: Operation,
     pub(crate) source: Endpoint,
@@ -296,6 +297,7 @@ fn plan_h2d(topology: &Topology, options: &BenchOptions, device_index: usize) ->
                 selected_group: queue.selected_group,
                 streams: queue.streams,
                 second_phase_streams: Vec::new(),
+                verification_stream: None,
                 transfer_class: TransferClass::H2D,
                 operation: Operation::HostToDevice,
                 source: Endpoint::Host,
@@ -324,6 +326,7 @@ fn plan_d2h(topology: &Topology, options: &BenchOptions, device_index: usize) ->
                 selected_group: queue.selected_group,
                 streams: queue.streams,
                 second_phase_streams: Vec::new(),
+                verification_stream: None,
                 transfer_class: TransferClass::D2H,
                 operation: Operation::DeviceToHost,
                 source: Endpoint::Device(device.index),
@@ -356,6 +359,7 @@ fn plan_same_device(
                 selected_group: queue.selected_group,
                 streams: queue.streams,
                 second_phase_streams: Vec::new(),
+                verification_stream: None,
                 transfer_class: TransferClass::D2DSameDevice,
                 operation: Operation::SameDevice,
                 source: Endpoint::Device(device.index),
@@ -383,104 +387,168 @@ fn plan_cross_device(
     for source_index in selected_local_devices(topology, options) {
         let source = &topology.devices[source_index];
         for destination_index in selected_peer_devices(topology, options, source) {
-            let destination = &topology.devices[destination_index];
-
-            for queue in queue_selections(source, options) {
-                let mut reasons = common_skip_reasons(&queue);
-                check_device_allocation_size(
-                    options.size_bytes,
-                    &[source, destination],
-                    &mut reasons,
-                );
-                check_saturation_partition(options, &queue.streams, &mut reasons);
-                if options.mode == BenchMode::Single {
-                    if let Some(group) = &queue.selected_group {
-                        require_destination_copy_queue(destination, group.ordinal, &mut reasons);
-                    }
-                }
-                let second_phase_streams = if class == TransferClass::D2DStaged {
-                    let destination_selection = destination_phase_selection(
-                        destination,
-                        options,
-                        queue.selected_group.as_ref(),
-                    );
-                    reasons.extend(common_skip_reasons(&destination_selection));
-                    check_saturation_partition(
-                        options,
-                        &destination_selection.streams,
-                        &mut reasons,
-                    );
-                    destination_selection.streams
-                } else {
-                    Vec::new()
-                };
-
-                let (operation, allocation, execution) = match class {
-                    TransferClass::D2DDirect => {
-                        if source.driver_index != destination.driver_index {
-                            reasons.push(
-                                "direct cross-device copy requires both devices in one Level Zero driver/context; current level_zero.rs exposes context creation per driver"
-                                    .to_owned(),
-                            );
-                        }
-                        (
-                            Operation::Direct {
-                                peer_access: topology
-                                    .peer_access_between(source.index, destination.index),
-                            },
-                            AllocationKind::Device,
-                            ExecutionPlan::Direct {
-                                source: source_index,
-                                destination: destination_index,
-                            },
-                        )
-                    }
-                    TransferClass::D2DStaged => {
-                        if source.driver_index != destination.driver_index {
-                            reasons.push(
-                                "explicit staged transfers across Level Zero drivers require one pinned host buffer usable by both contexts; current level_zero.rs exposes only context-owned host allocations"
-                                    .to_owned(),
-                            );
-                        }
-                        if options.timing == TimingMode::DeviceTimestamps {
-                            reasons.push(STAGED_DEVICE_TIMESTAMP_SKIP_REASON.to_owned());
-                        }
-                        (
-                            Operation::ExplicitStaged,
-                            AllocationKind::PinnedStaging,
-                            ExecutionPlan::Staged {
-                                source: source_index,
-                                destination: destination_index,
-                            },
-                        )
-                    }
-                    TransferClass::H2D | TransferClass::D2H | TransferClass::D2DSameDevice => {
-                        unreachable!("non-cross transfer class routed to cross planner")
-                    }
-                };
-
-                plans.push(CasePlan {
-                    mode: options.mode,
-                    selected_group: queue.selected_group,
-                    streams: queue.streams,
-                    second_phase_streams,
-                    transfer_class: class,
-                    operation,
-                    source: Endpoint::Device(source.index),
-                    destination: Endpoint::Device(destination.index),
-                    allocation,
-                    pcie_link: LinkInfo::Unknown {
-                        reason: "cross-device transfer has no single negotiated PCIe link"
-                            .to_owned(),
-                    },
-                    execution,
-                    skip_reasons: reasons,
-                });
-            }
+            plans.extend(plan_cross_device_pair(
+                topology,
+                options,
+                class,
+                source_index,
+                destination_index,
+            ));
         }
     }
 
     plans
+}
+
+fn plan_cross_device_pair(
+    topology: &Topology,
+    options: &BenchOptions,
+    class: TransferClass,
+    source_index: usize,
+    destination_index: usize,
+) -> Vec<CasePlan> {
+    let source = &topology.devices[source_index];
+    queue_selections(source, options)
+        .into_iter()
+        .map(|queue| {
+            plan_cross_device_case(
+                topology,
+                options,
+                class,
+                source_index,
+                destination_index,
+                queue,
+            )
+        })
+        .collect()
+}
+
+fn plan_cross_device_case(
+    topology: &Topology,
+    options: &BenchOptions,
+    class: TransferClass,
+    source_index: usize,
+    destination_index: usize,
+    queue: QueueSelection,
+) -> CasePlan {
+    let source = &topology.devices[source_index];
+    let destination = &topology.devices[destination_index];
+    let mut reasons = common_skip_reasons(&queue);
+    check_device_allocation_size(options.size_bytes, &[source, destination], &mut reasons);
+    check_saturation_partition(options, &queue.streams, &mut reasons);
+
+    let second_phase_streams = staged_destination_streams(
+        class,
+        destination,
+        options,
+        queue.selected_group.as_ref(),
+        &mut reasons,
+    );
+    let verification_stream = if class == TransferClass::D2DDirect {
+        destination_verification_stream(destination, &mut reasons)
+    } else {
+        None
+    };
+    let (operation, allocation, execution) = cross_device_semantics(
+        topology,
+        options,
+        class,
+        source_index,
+        destination_index,
+        &mut reasons,
+    );
+
+    CasePlan {
+        mode: options.mode,
+        selected_group: queue.selected_group,
+        streams: queue.streams,
+        second_phase_streams,
+        verification_stream,
+        transfer_class: class,
+        operation,
+        source: Endpoint::Device(source.index),
+        destination: Endpoint::Device(destination.index),
+        allocation,
+        pcie_link: LinkInfo::Unknown {
+            reason: "cross-device transfer has no single negotiated PCIe link".to_owned(),
+        },
+        execution,
+        skip_reasons: reasons,
+    }
+}
+
+fn staged_destination_streams(
+    class: TransferClass,
+    destination: &DeviceRecord,
+    options: &BenchOptions,
+    source_group: Option<&QueueGroupInfo>,
+    reasons: &mut Vec<String>,
+) -> Vec<QueueStreamInfo> {
+    if class != TransferClass::D2DStaged {
+        return Vec::new();
+    }
+
+    let selection = destination_phase_selection(destination, options, source_group);
+    reasons.extend(common_skip_reasons(&selection));
+    check_saturation_partition(options, &selection.streams, reasons);
+    selection.streams
+}
+
+fn cross_device_semantics(
+    topology: &Topology,
+    options: &BenchOptions,
+    class: TransferClass,
+    source_index: usize,
+    destination_index: usize,
+    reasons: &mut Vec<String>,
+) -> (Operation, AllocationKind, ExecutionPlan) {
+    let source = &topology.devices[source_index];
+    let destination = &topology.devices[destination_index];
+    let route = topology.peer_route_between(source.index, destination.index);
+
+    match class {
+        TransferClass::D2DDirect => {
+            if source.driver_index != destination.driver_index {
+                reasons.push(
+                    "direct cross-device copy requires both devices in one Level Zero driver/context; current level_zero.rs exposes context creation per driver"
+                        .to_owned(),
+                );
+            }
+            (
+                Operation::Direct {
+                    peer_access: topology.peer_access_between(source.index, destination.index),
+                    route,
+                },
+                AllocationKind::Device,
+                ExecutionPlan::Direct {
+                    source: source_index,
+                    destination: destination_index,
+                },
+            )
+        }
+        TransferClass::D2DStaged => {
+            if source.driver_index != destination.driver_index {
+                reasons.push(
+                    "explicit staged transfers across Level Zero drivers require one pinned host buffer usable by both contexts; current level_zero.rs exposes only context-owned host allocations"
+                        .to_owned(),
+                );
+            }
+            if options.timing == TimingMode::DeviceTimestamps {
+                reasons.push(STAGED_DEVICE_TIMESTAMP_SKIP_REASON.to_owned());
+            }
+            (
+                Operation::ExplicitStaged { route },
+                AllocationKind::PinnedStaging,
+                ExecutionPlan::Staged {
+                    source: source_index,
+                    destination: destination_index,
+                },
+            )
+        }
+        TransferClass::H2D | TransferClass::D2H | TransferClass::D2DSameDevice => {
+            unreachable!("non-cross transfer class routed to cross planner")
+        }
+    }
 }
 
 fn common_skip_reasons(queue: &QueueSelection) -> Vec<String> {
@@ -562,32 +630,31 @@ fn check_saturation_partition(
     }
 }
 
-fn require_destination_copy_queue<'device>(
-    destination: &'device DeviceRecord,
-    group_ordinal: u32,
+fn destination_verification_stream(
+    destination: &DeviceRecord,
     reasons: &mut Vec<String>,
-) -> Option<&'device QueueRecord> {
-    match destination
-        .queues
-        .iter()
-        .find(|queue| queue.info.ordinal == group_ordinal)
-    {
-        Some(queue) if queue.info.flags.copy => Some(queue),
-        Some(_) => {
-            reasons.push(format!(
-                "destination dev{} queue group {group_ordinal} does not advertise copy capability",
-                destination.index
-            ));
-            None
-        }
-        None => {
-            reasons.push(format!(
-                "destination dev{} has no usable queue group {group_ordinal}",
-                destination.index
-            ));
-            None
-        }
+) -> Option<QueueStreamInfo> {
+    let stream = first_copy_stream(destination.queues.iter().map(|queue| &queue.info));
+    if stream.is_none() {
+        reasons.push(format!(
+            "destination dev{} has no copy-capable engine for verification",
+            destination.index
+        ));
     }
+    stream
+}
+
+fn first_copy_stream<'queue>(
+    groups: impl IntoIterator<Item = &'queue QueueGroupInfo>,
+) -> Option<QueueStreamInfo> {
+    groups
+        .into_iter()
+        .find(|group| group.flags.copy && group.queue_count > 0)
+        .map(|group| QueueStreamInfo {
+            group_ordinal: group.ordinal,
+            queue_index: 0,
+            flags: group.flags,
+        })
 }
 
 pub(crate) fn joined_skip_reasons(reasons: &[String]) -> Option<String> {
@@ -605,6 +672,7 @@ impl CasePlan {
             selected_group: self.selected_group,
             streams: self.streams,
             second_phase_streams: self.second_phase_streams,
+            verification_stream: self.verification_stream,
             transfer_class: self.transfer_class,
             operation: self.operation,
             source: self.source,
@@ -667,15 +735,6 @@ fn format_case_size(bytes: u64) -> String {
     }
 
     format!("{bytes}B")
-}
-
-#[allow(dead_code)]
-fn queue_records(infos: &[QueueGroupInfo]) -> Vec<QueueRecord> {
-    infos
-        .iter()
-        .cloned()
-        .map(|info| QueueRecord { info })
-        .collect()
 }
 
 #[cfg(test)]
@@ -748,6 +807,17 @@ mod tests {
     }
 
     #[test]
+    fn verification_engine_does_not_need_to_match_measured_engine_id() {
+        let destination_groups = [queue(7, false, true), queue(9, true, false)];
+
+        let selected = first_copy_stream(&destination_groups).expect("copy engine");
+
+        assert_eq!(selected.group_ordinal, 9);
+        assert_eq!(selected.queue_index, 0);
+        assert!(selected.flags.copy);
+    }
+
+    #[test]
     fn case_id_uses_display_label_terms() {
         let plan = CasePlan {
             mode: BenchMode::Single,
@@ -761,6 +831,7 @@ mod tests {
                 },
             }],
             second_phase_streams: Vec::new(),
+            verification_stream: None,
             transfer_class: TransferClass::H2D,
             operation: Operation::HostToDevice,
             source: Endpoint::Host,

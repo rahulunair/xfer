@@ -15,16 +15,18 @@ mod command;
 mod error;
 mod event;
 mod execute;
+mod host;
 mod plan;
 mod sampling;
 mod saturation;
 mod topology;
 mod verify;
 
+use std::collections::BTreeSet;
 use std::io;
 
 use crate::cli::{BenchOptions, MIN_SAMPLES};
-use crate::output::{BenchReport, CaseOutcome, DeviceInfo, ListReport};
+use crate::output::{BenchReport, CaseOutcome, DeviceInfo, Endpoint, ListReport, SystemInfo};
 
 use self::error::CaseExecutionError;
 pub use self::error::{BenchmarkError, Result};
@@ -36,21 +38,7 @@ use self::topology::discover_topology;
 pub fn list() -> Result<ListReport> {
     let topology = discover_topology()?;
     Ok(ListReport {
-        devices: topology
-            .devices
-            .iter()
-            .map(|device| DeviceInfo {
-                index: device.index,
-                name: device.properties.name.clone(),
-                pci_address: device.pci_address.clone(),
-                pcie_link: device.pcie_link.clone(),
-                queue_groups: device
-                    .queues
-                    .iter()
-                    .map(|queue| queue.info.clone())
-                    .collect(),
-            })
-            .collect(),
+        devices: topology.devices.iter().map(device_info).collect(),
         peer_access: topology.peer_access,
     })
 }
@@ -74,11 +62,12 @@ where
         .map_err(|_| BenchmarkError::SizeTooLarge(options.size_bytes))?;
     let plans = plan_cases(&topology, options);
     let total = plans.len();
+    let system = system_info(&topology, &plans);
     let mut cases = Vec::with_capacity(total);
     let mut fanout = EventFanout::new(&mut reporter);
 
     fanout.emit(Event::TopologyPlanned {
-        device_count: topology.devices.len(),
+        system: &system,
         case_count: total,
     });
     reporter_ok(&mut fanout)?;
@@ -140,7 +129,44 @@ where
     });
     reporter_ok(&mut fanout)?;
 
-    Ok(BenchReport { cases })
+    Ok(BenchReport { system, cases })
+}
+
+fn system_info(topology: &topology::Topology, plans: &[plan::CasePlan]) -> SystemInfo {
+    let mut selected = BTreeSet::new();
+    for plan in plans {
+        for endpoint in [&plan.source, &plan.destination] {
+            if let Endpoint::Device(index) = endpoint {
+                selected.insert(*index);
+            }
+        }
+    }
+    let include_all = selected.is_empty();
+    let devices = topology
+        .devices
+        .iter()
+        .filter(|device| include_all || selected.contains(&device.index))
+        .map(device_info)
+        .collect();
+
+    SystemInfo {
+        host: host::discover_host(),
+        devices,
+    }
+}
+
+fn device_info(device: &topology::DeviceRecord) -> DeviceInfo {
+    DeviceInfo {
+        index: device.index,
+        name: device.properties.name.clone(),
+        pci_address: device.pci_address.clone(),
+        pcie_link: device.pcie_link.clone(),
+        queue_groups: device
+            .queues
+            .iter()
+            .map(|queue| queue.info.clone())
+            .collect(),
+    }
 }
 
 fn validate_options(options: &BenchOptions) -> Result<()> {

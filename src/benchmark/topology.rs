@@ -1,6 +1,6 @@
 use crate::level_zero as ze;
-use crate::output::{LinkInfo, PeerAccess, PeerAccessInfo, QueueFlags, QueueGroupInfo};
-use crate::pcie::{self, PcieLinkStatus, PcieLinkUnknown};
+use crate::output::{LinkInfo, PeerAccess, PeerAccessInfo, PeerRoute, QueueFlags, QueueGroupInfo};
+use crate::pcie::{self, PcieLinkStatus, PcieLinkUnknown, PciePeerRoute};
 
 use super::error::{BenchmarkError, Result};
 
@@ -12,6 +12,7 @@ pub(crate) struct DeviceRecord {
     pub(crate) driver_index: usize,
     pub(crate) device: ze::Device,
     pub(crate) properties: ze::DeviceProperties,
+    pub(crate) pci: Option<pcie::PciAddress>,
     pub(crate) pci_address: Option<String>,
     pub(crate) pcie_link: LinkInfo,
     pub(crate) queues: Vec<QueueRecord>,
@@ -42,7 +43,7 @@ pub(crate) fn discover_topology() -> Result<Topology> {
                 continue;
             }
 
-            let (pci_address, pcie_link) = read_device_link(&device);
+            let (pci, pci_address, pcie_link) = read_device_link(&device);
             let queues = device
                 .queue_groups()?
                 .into_iter()
@@ -68,6 +69,7 @@ pub(crate) fn discover_topology() -> Result<Topology> {
                 driver_index: device.driver_index(),
                 device,
                 properties,
+                pci,
                 pci_address,
                 pcie_link,
                 queues,
@@ -103,6 +105,7 @@ fn query_peer_access(devices: &[DeviceRecord]) -> Vec<PeerAccessInfo> {
                 from_device: from.index,
                 to_device: to.index,
                 access,
+                route: peer_route(from, to),
             });
         }
     }
@@ -110,11 +113,12 @@ fn query_peer_access(devices: &[DeviceRecord]) -> Vec<PeerAccessInfo> {
     peers
 }
 
-fn read_device_link(device: &ze::Device) -> (Option<String>, LinkInfo) {
+fn read_device_link(device: &ze::Device) -> (Option<pcie::PciAddress>, Option<String>, LinkInfo) {
     let pci = match device.pci_address() {
         Ok(pci) => pci,
         Err(error) => {
             return (
+                None,
                 None,
                 LinkInfo::Unknown {
                     reason: format!("zeDevicePciGetPropertiesExt unavailable: {error}"),
@@ -137,7 +141,41 @@ fn read_device_link(device: &ze::Device) -> (Option<String>, LinkInfo) {
             },
         };
 
-    (address_text, link)
+    (address, address_text, link)
+}
+
+fn peer_route(source: &DeviceRecord, destination: &DeviceRecord) -> PeerRoute {
+    let (Some(source_pci), Some(destination_pci)) = (source.pci, destination.pci) else {
+        return PeerRoute::Unknown("Level Zero PCI address unavailable".to_owned());
+    };
+
+    match pcie::read_peer_route(source_pci, destination_pci) {
+        Ok(PciePeerRoute::SameRootPort { root_port }) => PeerRoute::SameRootPort {
+            root_port: root_port.to_string(),
+        },
+        Ok(PciePeerRoute::SharedUpstreamBridge { common_bridge }) => {
+            PeerRoute::SharedUpstreamBridge {
+                common_bridge: common_bridge.to_string(),
+            }
+        }
+        Ok(PciePeerRoute::DifferentRootPorts {
+            host_bridge,
+            source_root_port,
+            destination_root_port,
+        }) => PeerRoute::DifferentRootPorts {
+            host_bridge,
+            source_root_port: source_root_port.to_string(),
+            destination_root_port: destination_root_port.to_string(),
+        },
+        Ok(PciePeerRoute::CrossHostBridges {
+            source_host_bridge,
+            destination_host_bridge,
+        }) => PeerRoute::CrossHostBridges {
+            source_host_bridge,
+            destination_host_bridge,
+        },
+        Err(reason) => PeerRoute::Unknown(pcie_unknown_reason(&reason)),
+    }
 }
 
 fn pcie_unknown_reason(reason: &PcieLinkUnknown) -> String {
@@ -181,6 +219,16 @@ impl Topology {
             .map_or_else(
                 || PeerAccess::Unknown("zeDeviceCanAccessPeer was not queried".to_owned()),
                 |peer| peer.access.clone(),
+            )
+    }
+
+    pub(crate) fn peer_route_between(&self, from_device: u32, to_device: u32) -> PeerRoute {
+        self.peer_access
+            .iter()
+            .find(|peer| peer.from_device == from_device && peer.to_device == to_device)
+            .map_or_else(
+                || PeerRoute::Unknown("PCIe peer topology was not queried".to_owned()),
+                |peer| peer.route.clone(),
             )
     }
 }

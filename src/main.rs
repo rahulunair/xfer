@@ -27,6 +27,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let stderr_is_terminal = io::stderr().is_terminal();
             let text_options = TextOptions {
                 include_histogram: options.histogram,
+                summary_only: options.summary_only,
                 color: color_mode(options.format, stdout_is_terminal),
             };
             let status_mode = status_mode(options.format, stderr_is_terminal);

@@ -7,6 +7,7 @@ use crate::stats::Summary;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextOptions {
     pub include_histogram: bool,
+    pub summary_only: bool,
     pub color: ColorMode,
 }
 
@@ -14,6 +15,7 @@ impl Default for TextOptions {
     fn default() -> Self {
         Self {
             include_histogram: true,
+            summary_only: false,
             color: ColorMode::Never,
         }
     }
@@ -29,6 +31,20 @@ pub enum ColorMode {
 pub struct ListReport {
     pub devices: Vec<DeviceInfo>,
     pub peer_access: Vec<PeerAccessInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostInfo {
+    pub cpu_model: String,
+    pub logical_cpus: usize,
+    pub physical_cores: Option<usize>,
+    pub sockets: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemInfo {
+    pub host: HostInfo,
+    pub devices: Vec<DeviceInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,12 +93,33 @@ pub struct PeerAccessInfo {
     pub from_device: u32,
     pub to_device: u32,
     pub access: PeerAccess,
+    pub route: PeerRoute,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerAccess {
     Yes,
     No,
+    Unknown(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeerRoute {
+    SameRootPort {
+        root_port: String,
+    },
+    SharedUpstreamBridge {
+        common_bridge: String,
+    },
+    DifferentRootPorts {
+        host_bridge: String,
+        source_root_port: String,
+        destination_root_port: String,
+    },
+    CrossHostBridges {
+        source_host_bridge: String,
+        destination_host_bridge: String,
+    },
     Unknown(String),
 }
 
@@ -98,6 +135,7 @@ impl PeerAccess {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BenchReport {
+    pub system: SystemInfo,
     pub cases: Vec<BenchCase>,
 }
 
@@ -107,6 +145,7 @@ pub struct BenchCase {
     pub selected_group: Option<QueueGroupInfo>,
     pub streams: Vec<QueueStreamInfo>,
     pub second_phase_streams: Vec<QueueStreamInfo>,
+    pub verification_stream: Option<QueueStreamInfo>,
     pub transfer_class: TransferClass,
     pub operation: Operation,
     pub source: Endpoint,
@@ -125,8 +164,13 @@ pub enum Operation {
     HostToDevice,
     DeviceToHost,
     SameDevice,
-    Direct { peer_access: PeerAccess },
-    ExplicitStaged,
+    Direct {
+        peer_access: PeerAccess,
+        route: PeerRoute,
+    },
+    ExplicitStaged {
+        route: PeerRoute,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

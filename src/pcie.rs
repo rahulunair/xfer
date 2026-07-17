@@ -117,6 +117,25 @@ pub enum PcieLinkStatus {
     Unknown(PcieLinkUnknown),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PciePeerRoute {
+    SameRootPort {
+        root_port: PciAddress,
+    },
+    SharedUpstreamBridge {
+        common_bridge: PciAddress,
+    },
+    DifferentRootPorts {
+        host_bridge: String,
+        source_root_port: PciAddress,
+        destination_root_port: PciAddress,
+    },
+    CrossHostBridges {
+        source_host_bridge: String,
+        destination_host_bridge: String,
+    },
+}
+
 pub fn read_link(address: PciAddress) -> PcieLinkStatus {
     read_link_from_sysfs(Path::new("/sys"), address)
 }
@@ -174,6 +193,24 @@ pub fn pci_device_path(
     address: PciAddress,
 ) -> Result<PathBuf, PcieLinkUnknown> {
     resolve_pci_device(sysfs_root, address).map(|device| device.device_sysfs)
+}
+
+pub fn read_peer_route(
+    source: PciAddress,
+    destination: PciAddress,
+) -> Result<PciePeerRoute, PcieLinkUnknown> {
+    read_peer_route_from_sysfs(Path::new("/sys"), source, destination)
+}
+
+pub fn read_peer_route_from_sysfs(
+    sysfs_root: impl AsRef<Path>,
+    source: PciAddress,
+    destination: PciAddress,
+) -> Result<PciePeerRoute, PcieLinkUnknown> {
+    let source = resolve_pci_device(sysfs_root.as_ref(), source)?;
+    let destination = resolve_pci_device(sysfs_root.as_ref(), destination)?;
+    classify_peer_route(&source, &destination)
+        .ok_or_else(|| PcieLinkUnknown::UnreliableDevicePath(source.device_sysfs.clone()))
 }
 
 pub fn parse_link_speed(text: &str) -> Option<LinkSpeed> {
@@ -324,6 +361,49 @@ fn negotiated_link_source_path(
     Err(PcieLinkUnknown::UnreliableDevicePath(
         device.device_sysfs.clone(),
     ))
+}
+
+fn classify_peer_route(
+    source: &ResolvedPciDevice,
+    destination: &ResolvedPciDevice,
+) -> Option<PciePeerRoute> {
+    let source_host = source.canonical_bdfs.first()?.1.parent()?;
+    let destination_host = destination.canonical_bdfs.first()?.1.parent()?;
+    let source_host_name = source_host.file_name()?.to_str()?.to_owned();
+    let destination_host_name = destination_host.file_name()?.to_str()?.to_owned();
+
+    if source_host != destination_host {
+        return Some(PciePeerRoute::CrossHostBridges {
+            source_host_bridge: source_host_name,
+            destination_host_bridge: destination_host_name,
+        });
+    }
+
+    let common_bridges = source
+        .canonical_bdfs
+        .iter()
+        .zip(&destination.canonical_bdfs)
+        .take_while(|((source_address, _), (destination_address, _))| {
+            source_address == destination_address
+        })
+        .map(|((address, _), _)| *address)
+        .collect::<Vec<_>>();
+    if let [root_port] = common_bridges.as_slice() {
+        return Some(PciePeerRoute::SameRootPort {
+            root_port: *root_port,
+        });
+    }
+    if let Some(common_bridge) = common_bridges.last() {
+        return Some(PciePeerRoute::SharedUpstreamBridge {
+            common_bridge: *common_bridge,
+        });
+    }
+
+    Some(PciePeerRoute::DifferentRootPorts {
+        host_bridge: source_host_name,
+        source_root_port: source.canonical_bdfs.first()?.0,
+        destination_root_port: destination.canonical_bdfs.first()?.0,
+    })
 }
 
 fn matching_slot_ancestor_paths(
@@ -773,6 +853,140 @@ mod tests {
             }
             PcieLinkStatus::Unknown(reason) => panic!("expected known link, got {reason:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifies_peer_route_through_a_shared_upstream_bridge() {
+        let sysfs = TestSysfs::new();
+        let root_port = PciAddress::new(0, 0x10, 1, 0).expect("root port");
+        let shared_bridge = PciAddress::new(0, 0x11, 0, 0).expect("shared bridge");
+        let source_port = PciAddress::new(0, 0x12, 1, 0).expect("source port");
+        let destination_port = PciAddress::new(0, 0x12, 2, 0).expect("destination port");
+        let source = PciAddress::new(0, 0x13, 0, 0).expect("source");
+        let destination = PciAddress::new(0, 0x14, 0, 0).expect("destination");
+        sysfs.add_nested_device(
+            source,
+            &[root_port, shared_bridge, source_port, source],
+            "32.0 GT/s PCIe",
+            "16",
+            "32.0 GT/s PCIe",
+            "16",
+        );
+        sysfs.add_nested_device(
+            destination,
+            &[root_port, shared_bridge, destination_port, destination],
+            "32.0 GT/s PCIe",
+            "16",
+            "32.0 GT/s PCIe",
+            "16",
+        );
+
+        assert_eq!(
+            read_peer_route_from_sysfs(&sysfs.root, source, destination),
+            Ok(PciePeerRoute::SharedUpstreamBridge {
+                common_bridge: shared_bridge
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifies_peer_route_with_only_one_common_root_port() {
+        let sysfs = TestSysfs::new();
+        let root_port = PciAddress::new(0, 0x18, 1, 0).expect("root port");
+        let source = PciAddress::new(0, 0x19, 0, 0).expect("source");
+        let destination = PciAddress::new(0, 0x1a, 0, 0).expect("destination");
+        sysfs.add_nested_device(
+            source,
+            &[root_port, source],
+            "32.0 GT/s PCIe",
+            "16",
+            "32.0 GT/s PCIe",
+            "16",
+        );
+        sysfs.add_nested_device(
+            destination,
+            &[root_port, destination],
+            "32.0 GT/s PCIe",
+            "16",
+            "32.0 GT/s PCIe",
+            "16",
+        );
+
+        assert_eq!(
+            read_peer_route_from_sysfs(&sysfs.root, source, destination),
+            Ok(PciePeerRoute::SameRootPort { root_port })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifies_peer_route_across_root_ports_on_one_host_bridge() {
+        let sysfs = TestSysfs::new();
+        let source_root = PciAddress::new(0, 0x20, 1, 0).expect("source root port");
+        let destination_root = PciAddress::new(0, 0x20, 2, 0).expect("destination root port");
+        let source = PciAddress::new(0, 0x21, 0, 0).expect("source");
+        let destination = PciAddress::new(0, 0x22, 0, 0).expect("destination");
+        sysfs.add_nested_device(
+            source,
+            &[source_root, source],
+            "32.0 GT/s PCIe",
+            "16",
+            "32.0 GT/s PCIe",
+            "16",
+        );
+        sysfs.add_nested_device(
+            destination,
+            &[destination_root, destination],
+            "32.0 GT/s PCIe",
+            "16",
+            "32.0 GT/s PCIe",
+            "16",
+        );
+
+        assert_eq!(
+            read_peer_route_from_sysfs(&sysfs.root, source, destination),
+            Ok(PciePeerRoute::DifferentRootPorts {
+                host_bridge: "pci0000:20".to_owned(),
+                source_root_port: source_root,
+                destination_root_port: destination_root,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifies_peer_route_across_host_bridges() {
+        let sysfs = TestSysfs::new();
+        let source_root = PciAddress::new(0, 0x30, 1, 0).expect("source root port");
+        let destination_root = PciAddress::new(0, 0x40, 1, 0).expect("destination root port");
+        let source = PciAddress::new(0, 0x31, 0, 0).expect("source");
+        let destination = PciAddress::new(0, 0x41, 0, 0).expect("destination");
+        sysfs.add_nested_device(
+            source,
+            &[source_root, source],
+            "32.0 GT/s PCIe",
+            "16",
+            "32.0 GT/s PCIe",
+            "16",
+        );
+        sysfs.add_nested_device(
+            destination,
+            &[destination_root, destination],
+            "32.0 GT/s PCIe",
+            "16",
+            "32.0 GT/s PCIe",
+            "16",
+        );
+
+        assert_eq!(
+            read_peer_route_from_sysfs(&sysfs.root, source, destination),
+            Ok(PciePeerRoute::CrossHostBridges {
+                source_host_bridge: "pci0000:30".to_owned(),
+                destination_host_bridge: "pci0000:40".to_owned(),
+            })
+        );
     }
 
     #[cfg(unix)]

@@ -1,133 +1,124 @@
 # xfer
 
-`xfer` is a small Unix-style CLI for measuring host/device and
-device/device transfer performance on Intel GPUs through the Level Zero API.
-It reports application-observed wall-clock time by default and can use Level
-Zero device timestamps when the selected device supports them.
+`xfer` is a small Rust CLI for measuring Intel GPU transfer bandwidth through
+the Level Zero API. It verifies every copy and clearly separates:
 
-The normal workflow needs no hardware-specific arguments:
+- direct device-to-device copy requests;
+- explicit copies staged through pinned host memory;
+- Level Zero peer-access permission;
+- PCIe attachment topology;
+- the physical P2P route, which requires tracing or platform counters to prove.
 
-```sh
-xfer bench
-```
+## Quick Start
 
-`xfer` discovers the GPUs and usable copy paths, verifies every copy, and
-prints measured bandwidth beside the negotiated PCIe payload ceiling. This is
-a low-level transfer baseline for diagnosing slower CCL or model workloads; it
-does not claim to measure those higher-level runtimes.
-
-## Requirements
-
-To run a prebuilt `xfer` binary:
-
-- 64-bit x86 Linux with glibc compatible with the release artifact
-- The Level Zero loader (`libze_loader.so.1`) and Intel GPU driver
-- Permission to access the Intel GPU devices
-
-The binary has no configuration files, daemon, language runtime, or bundled
-GPU libraries. Copy the single executable to another machine whose Intel
-Level Zero runtime is already working.
-
-To build `xfer`:
-
-- Rust 1.85 or newer
-- Clang and libclang (used by `bindgen`)
-- Level Zero headers providing `level_zero/ze_api.h`
-- The Level Zero loader library (`libze_loader.so`)
-
-On Arch Linux, the development prerequisites are provided by packages such as
-`rust`, `clang`, and `level-zero-loader`. Package names differ by distribution.
-
-## Build and test
+Build requirements: Rust 1.85+, Clang/libclang, Level Zero headers, and the
+Level Zero loader.
 
 ```sh
 cargo build --release
-cargo test
+./target/release/xfer list
+```
+
+Get one sustained direct-copy row for every ordered GPU pair, using all
+copy-capable queues:
+
+```sh
+./target/release/xfer bench --class d2d-direct --saturation --summary-only
+```
+
+Pairs run sequentially. Host byte verification is automatic and outside the
+timed interval.
+
+## Common Commands
+
+| Task | Command |
+| --- | --- |
+| Inspect GPUs, engines, peer access, and PCIe topology | `xfer list` |
+| Direct-copy ceiling for every GPU pair | `xfer bench --class d2d-direct --saturation --summary-only` |
+| Detailed result for one pair | `xfer bench --device 0 --peer-device 1 --class d2d-direct --saturation` |
+| Full transfer matrix, compact report | `xfer bench --summary-only` |
+| Stable machine-readable output | `xfer bench --format csv` |
+
+Run `xfer bench --help` for advanced filters.
+
+## Example Result
+
+```text
+System under test
+  Host  Intel(R) Xeon(R) 676X
+        1 socket, 32 cores, 64 threads
+  dev0  Intel(R) Arc(TM) Pro B70 Graphics
+        PCI 0000:0d:00.0 | Gen5 x16 | 63 GB/s theoretical
+        engines 0 compute+copy; 1 copy
+  dev1  Intel(R) Arc(TM) Pro B70 Graphics
+        PCI 0000:64:00.0 | Gen5 x16 | 63 GB/s theoretical
+        engines 0 compute+copy; 1 copy
+
+D2D direct dev0 -> dev1
+  Transfer
+    payload             256 MiB
+    mode                saturation across 2 queues; payload partitioned across queues
+    queues              engine 0 / queue 0 (compute+copy); engine 1 / queue 0 (copy)
+    memory              device memory
+    timing              wall clock, 50 samples, 1 s warm-up
+
+  P2P evidence
+    copy request        direct GPU-memory copy (Level Zero)
+    peer access         supported (zeDeviceCanAccessPeer = yes)
+    PCIe topology       different host bridges pci0000:0a -> pci0000:61
+    host staging        none requested by xfer
+    physical P2P        not measured; requires platform counters or tracing
+    verification        dev1, engine 0 / queue 0; outside timing
+
+                lower        median       upper
+  time        [ 13.779 ms    13.782 ms    13.783 ms   ]
+  throughput  [ 19.475 GB/s  19.477 GB/s  19.482 GB/s ]
+                95% bootstrap confidence interval (10000 resamples)
+  sample       p5 19.46 GB/s, p95 26.48 GB/s
+  variability  MAD 0.01 GB/s
+  outliers     9/50 (1 mild, 8 severe)
+
+  distribution  GB/s (50 samples)
+    19.4 | ########################  median
+    20.2 |
+    21.0 |
+    21.8 | #
+    22.6 |
+    23.3 |
+    24.1 |
+    24.9 |
+    25.7 | ##
+    26.5 | ##
+    27.2 |
+    28.0 | #
+```
+
+Use the median as the sustained pairwise bandwidth input. Short bursts in the
+upper tail are not a stable roofline.
+
+## Interpretation
+
+- `direct` means one Level Zero copy request between allocations on different
+  GPUs. `xfer` does not insert a host stage into that timed path.
+- Destination verification copies bytes back after timing; it is not part of
+  the measured transfer and is not a staging leg.
+- `explicit-staged` measures D2H, a synchronization point, then H2D through
+  pinned host memory. It reports logical payload rate and 2x copy traffic.
+- `peer access: supported` is the Level Zero P2P capability result. It does not
+  prove the physical DMA route.
+- PCIe topology labels come from endpoint ancestry in sysfs.
+- Pair tests are isolated directional ceilings, not concurrent tensor-parallel
+  collective benchmarks.
+
+Rates use decimal GB/s. Wall-clock timing is the default.
+
+See [HOW_IT_WORKS.md](HOW_IT_WORKS.md) for measurement boundaries, statistics,
+saturation semantics, and comparison notes.
+
+## Validate
+
+```sh
+cargo fmt --all -- --check
+cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
-
-The build script generates raw Rust bindings from the installed Level Zero
-header and uses `pkg-config` when available. For a non-standard installation,
-set `LEVEL_ZERO_INCLUDE` to the directory containing `level_zero` and
-`LEVEL_ZERO_LIB` to the loader library directory:
-
-```sh
-LEVEL_ZERO_INCLUDE=/opt/level-zero/include \
-LEVEL_ZERO_LIB=/opt/level-zero/lib \
-cargo build --release
-```
-
-## Usage
-
-List GPUs, queue groups, queue counts, peer-access capability, and negotiated
-PCIe links:
-
-```sh
-xfer list
-```
-
-Run the default useful transfer matrix:
-
-```sh
-xfer bench
-```
-
-Select a transfer and queue group explicitly:
-
-```sh
-xfer bench --device 0 --class h2d --queue-group 1 --size 256MiB --samples 50
-```
-
-Measure aggregate saturation across all copy-capable queue streams:
-
-```sh
-xfer bench --saturation
-xfer bench -s --device 0 --class d2d-same-device
-xfer bench -s --queue-group 1
-```
-
-Produce stable machine-readable output:
-
-```sh
-xfer bench --format csv --no-histogram
-```
-
-Device, queue-group, transfer-class, size, and sample controls are advanced
-overrides. Use `xfer --help` or `xfer bench --help` for the complete
-interface.
-
-See [HOW_IT_WORKS.md](HOW_IT_WORKS.md) for the exact timed intervals,
-saturation payload accounting, statistical definitions, queue terminology,
-and comparison conditions for Intel's `ze_peer`.
-
-## Timing and interpretation
-
-Wall-clock samples cover command submission through queue synchronization.
-Device-timestamp samples are clearly labeled and are never combined with
-wall-clock samples.
-
-Each case uses a flat sample design: one sample is one independently timed and
-verified transfer. Warm-up uses the same command path, while allocation,
-initialization, destination clearing, and byte verification stay outside the
-measured interval. Increasing iteration counts and fitting a time-per-iteration
-regression would hide transfer-to-transfer variation, so `xfer` does not use
-that CPU microbenchmark technique.
-
-The main interval is a deterministic 95% percentile-bootstrap confidence
-interval for the median measured duration, using 10,000 resamples with
-replacement. Bandwidth estimates and interval bounds are derived by inverting
-those duration estimates. The report also retains the bandwidth sample p5/p95
-spread and unscaled median absolute deviation. Modified Tukey fences at 1.5
-and 3 interquartile ranges classify measured durations; outliers are reported
-but never discarded. At least 10 samples are required.
-
-Cross-device `direct` means one Level Zero memory-copy command between
-allocations owned by different devices. The separately reported
-`peer-access=yes|no` value comes from `zeDeviceCanAccessPeer`; it does not prove
-that the physical transfer used a peer-to-peer path. `explicit-staged` is one
-end-to-end sample containing D2H followed by H2D through pinned host memory,
-with synchronization between legs for correctness.
-
-Rates use decimal GB/s (`1 GB = 1e9 bytes`). PCIe percentages use the negotiated
-link generation and width read from sysfs. Link data is reported as `unknown`
-when the Level Zero device cannot be mapped reliably to a PCI device.

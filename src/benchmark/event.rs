@@ -2,7 +2,7 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
-use crate::output::BenchCase;
+use crate::output::{BenchCase, SystemInfo};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseId(String);
@@ -26,7 +26,7 @@ impl fmt::Display for CaseId {
 
 pub enum BenchEvent<'a> {
     TopologyPlanned {
-        device_count: usize,
+        system: &'a SystemInfo,
         case_count: usize,
     },
     CaseStart {
@@ -156,7 +156,15 @@ mod tests {
             let mut fanout = EventFanout::new(&mut report);
 
             fanout.emit(BenchEvent::TopologyPlanned {
-                device_count: 1,
+                system: &SystemInfo {
+                    host: crate::output::HostInfo {
+                        cpu_model: "test".to_owned(),
+                        logical_cpus: 1,
+                        physical_cores: Some(1),
+                        sockets: Some(1),
+                    },
+                    devices: Vec::new(),
+                },
                 case_count: 1,
             });
             fanout.emit(BenchEvent::CaseStart {

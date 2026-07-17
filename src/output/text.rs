@@ -1,6 +1,6 @@
 use super::model::{
     BenchCase, BenchReport, CaseOutcome, ColorMode, LinkInfo, ListReport, Operation, PeerAccess,
-    QueueFlags, QueueStreamInfo, TextOptions,
+    PeerRoute, QueueFlags, QueueStreamInfo, SystemInfo, TextOptions,
 };
 use crate::cli::TransferClass;
 use crate::histogram::Histogram;
@@ -26,7 +26,7 @@ pub fn render_list(report: &ListReport) -> String {
 
         for queue in &device.queue_groups {
             lines.push(format!(
-                "  queue group {} ({}, {})",
+                "  engine {} ({}, {})",
                 queue.ordinal,
                 render_queue_flags(queue.flags),
                 render_queue_count(queue.queue_count)
@@ -36,18 +36,19 @@ pub fn render_list(report: &ListReport) -> String {
 
     if !report.peer_access.is_empty() {
         lines.push(String::new());
-        lines.push("peer access capability (zeDeviceCanAccessPeer)".to_owned());
+        lines.push("device-to-device access (Level Zero peer check)".to_owned());
         for peer in &report.peer_access {
             let reason = match &peer.access {
                 PeerAccess::Unknown(reason) => format!(" ({reason})"),
                 PeerAccess::Yes | PeerAccess::No => String::new(),
             };
             lines.push(format!(
-                "  dev{} -> dev{}  {}{}",
+                "  dev{} -> dev{}  {}{}  [{}]",
                 peer.from_device,
                 peer.to_device,
                 peer.access.as_field(),
-                reason
+                reason,
+                render_peer_route(&peer.route)
             ));
         }
     }
@@ -56,7 +57,11 @@ pub fn render_list(report: &ListReport) -> String {
 }
 
 pub fn render_bench_text(report: &BenchReport, options: &TextOptions) -> String {
-    let mut lines = Vec::new();
+    if options.summary_only {
+        return render_bench_summary(report, options);
+    }
+
+    let mut lines = render_system_lines(&report.system, options.color);
 
     if report.cases.is_empty() {
         lines.push("no benchmark cases selected".to_owned());
@@ -69,12 +74,467 @@ pub fn render_bench_text(report: &BenchReport, options: &TextOptions) -> String 
         }
         lines.extend(render_case_lines(case, options));
     }
+    if report.cases.len() > 1 {
+        lines.push(String::new());
+        lines.extend(render_summary_lines(&report.cases, options.color));
+    }
 
     finish_lines(lines)
 }
 
+pub fn render_bench_summary(report: &BenchReport, options: &TextOptions) -> String {
+    let mut lines = render_system_lines(&report.system, options.color);
+    lines.extend(render_summary_lines(&report.cases, options.color));
+    finish_lines(lines)
+}
+
+pub(crate) fn render_summary_text(cases: &[BenchCase], options: &TextOptions) -> String {
+    finish_lines(render_summary_lines(cases, options.color))
+}
+
+pub(crate) fn render_system_text(system: &SystemInfo, color: ColorMode) -> String {
+    finish_lines(render_system_lines(system, color))
+}
+
 pub fn render_case_text(case: &BenchCase, options: &TextOptions) -> String {
     finish_lines(render_case_lines(case, options))
+}
+
+fn render_system_lines(system: &SystemInfo, color: ColorMode) -> Vec<String> {
+    let mut lines = vec![
+        paint(color, "\u{1b}[1;36m", "System under test"),
+        format!("  Host  {}", system.host.cpu_model),
+        format!("        {}", render_cpu_topology(system)),
+    ];
+
+    for device in &system.devices {
+        let pci = device.pci_address.as_deref().unwrap_or("unknown");
+        lines.push(format!("  dev{}  {}", device.index, device.name));
+        lines.push(format!(
+            "        PCI {pci} | {}",
+            render_system_link(&device.pcie_link)
+        ));
+        lines.push(format!("        engines {}", render_system_engines(device)));
+    }
+    lines.push(String::new());
+    lines
+}
+
+fn render_cpu_topology(system: &SystemInfo) -> String {
+    let threads = match system.host.logical_cpus {
+        0 => "threads unknown".to_owned(),
+        count => format!("{count} {}", plural(count, "thread", "threads")),
+    };
+    match (system.host.sockets, system.host.physical_cores) {
+        (Some(sockets), Some(cores)) => format!(
+            "{sockets} {}, {cores} {}, {threads}",
+            plural(sockets, "socket", "sockets"),
+            plural(cores, "core", "cores")
+        ),
+        (Some(sockets), None) => {
+            format!(
+                "{sockets} {}, {threads}",
+                plural(sockets, "socket", "sockets")
+            )
+        }
+        (None, Some(cores)) => {
+            format!("{cores} {}, {threads}", plural(cores, "core", "cores"))
+        }
+        (None, None) => threads,
+    }
+}
+
+fn render_system_link(link: &LinkInfo) -> String {
+    match link {
+        LinkInfo::Known {
+            generation,
+            width,
+            theoretical_gb_s,
+        } => format!(
+            "Gen{generation} x{width} | {} theoretical",
+            format_rate(*theoretical_gb_s)
+        ),
+        LinkInfo::Unknown { reason } => {
+            format!("PCIe link unknown ({})", sanitize_human_text(reason))
+        }
+    }
+}
+
+fn render_system_engines(device: &super::model::DeviceInfo) -> String {
+    if device.queue_groups.is_empty() {
+        return "none".to_owned();
+    }
+
+    device
+        .queue_groups
+        .iter()
+        .map(|group| {
+            let queues = if group.queue_count > 1 {
+                format!(" ({} queues)", group.queue_count)
+            } else {
+                String::new()
+            };
+            format!(
+                "{} {}{queues}",
+                group.ordinal,
+                render_queue_flags(group.flags)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+struct SummaryRow {
+    transfer: String,
+    path: String,
+    queues: String,
+    median: String,
+    spread: String,
+    mad: String,
+    outliers: String,
+    mild_outliers: usize,
+    severe_outliers: usize,
+    skipped: bool,
+}
+
+const SUMMARY_HEADERS: [&str; 7] = [
+    "transfer",
+    "path",
+    "engine(s)",
+    "median GB/s",
+    "p5..p95 GB/s",
+    "MAD GB/s",
+    "outliers",
+];
+const P2P_FACT_HEADERS: [&str; 5] = [
+    "pair",
+    "copy request",
+    "peer access",
+    "PCIe topology",
+    "physical P2P",
+];
+
+fn render_summary_lines(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
+    if cases.is_empty() {
+        return vec!["no benchmark cases selected".to_owned()];
+    }
+
+    let mut lines = summary_heading(cases, color);
+    let rows = cases.iter().map(summary_row).collect::<Vec<_>>();
+    lines.extend(render_summary_table(&rows, color));
+    append_skipped_cases(&mut lines, cases, color);
+    lines.extend(render_p2p_facts(cases, color));
+    append_summary_notes(&mut lines, cases, color);
+    lines
+}
+
+fn summary_heading(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
+    let measured = cases
+        .iter()
+        .filter(|case| matches!(case.outcome, CaseOutcome::Measured { .. }))
+        .count();
+    let skipped = cases.len() - measured;
+    let first = &cases[0];
+    let case_label = if cases.len() == 1 { "case" } else { "cases" };
+    vec![
+        paint(color, "\u{1b}[1;36m", "Run summary"),
+        paint(
+            color,
+            "\u{1b}[2m",
+            &format!(
+                "  {} {case_label} | {measured} measured | {skipped} skipped | {} | {} | {} samples | {} warm-up | {}",
+                cases.len(),
+                format_bytes(first.byte_count),
+                render_timing(first.timing),
+                first.requested_samples,
+                format_duration(first.warmup),
+                first.mode
+            ),
+        ),
+        String::new(),
+    ]
+}
+
+fn render_summary_table(rows: &[SummaryRow], color: ColorMode) -> Vec<String> {
+    let widths = std::array::from_fn::<_, 7, _>(|index| {
+        rows.iter()
+            .map(|row| summary_row_fields(row)[index].len())
+            .chain(std::iter::once(SUMMARY_HEADERS[index].len()))
+            .max()
+            .unwrap_or(SUMMARY_HEADERS[index].len())
+    });
+    let header = SUMMARY_HEADERS
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
+        .collect::<Vec<_>>()
+        .join("  ");
+    let mut lines = vec![format!("  {}", paint(color, "\u{1b}[2m", &header))];
+    lines.extend(
+        rows.iter()
+            .map(|row| render_summary_row(row, widths, color)),
+    );
+    lines
+}
+
+fn render_summary_row(row: &SummaryRow, widths: [usize; 7], color: ColorMode) -> String {
+    let fields = summary_row_fields(row);
+    let transfer = format!("{:<width$}", fields[0], width = widths[0]);
+    let path = format!("{:<width$}", fields[1], width = widths[1]);
+    let queues = format!("{:<width$}", fields[2], width = widths[2]);
+    let median = format!("{:>width$}", fields[3], width = widths[3]);
+    let spread = format!("{:>width$}", fields[4], width = widths[4]);
+    let mad = format!("{:>width$}", fields[5], width = widths[5]);
+    let outliers = format!("{:>width$}", fields[6], width = widths[6]);
+    let metric_style = if row.skipped {
+        "\u{1b}[33m"
+    } else {
+        "\u{1b}[1;32m"
+    };
+    let outlier_style = if row.severe_outliers > 0 {
+        "\u{1b}[31m"
+    } else if row.mild_outliers > 0 {
+        "\u{1b}[33m"
+    } else {
+        "\u{1b}[2m"
+    };
+    format!(
+        "  {transfer}  {}  {queues}  {}  {spread}  {mad}  {}",
+        paint(color, "\u{1b}[36m", &path),
+        paint(color, metric_style, &median),
+        paint(color, outlier_style, &outliers)
+    )
+}
+
+fn append_skipped_cases(lines: &mut Vec<String>, cases: &[BenchCase], color: ColorMode) {
+    let skipped_cases = cases
+        .iter()
+        .filter_map(|case| match &case.outcome {
+            CaseOutcome::Skipped { reason } => Some((case, reason)),
+            CaseOutcome::Measured { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if !skipped_cases.is_empty() {
+        lines.push(String::new());
+        lines.push(paint(color, "\u{1b}[1;33m", "  Skipped cases"));
+        for (case, reason) in skipped_cases {
+            lines.push(format!(
+                "    {}: {}",
+                case_label(case),
+                sanitize_human_text(reason)
+            ));
+        }
+    }
+}
+
+fn render_p2p_facts(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
+    let mut facts = Vec::<[String; 5]>::new();
+    for case in cases {
+        let Operation::Direct { peer_access, route } = &case.operation else {
+            continue;
+        };
+        let pair = format!("{} -> {}", case.source, case.destination);
+        if facts.iter().any(|fact| fact[0] == pair) {
+            continue;
+        }
+        facts.push([
+            pair,
+            "Level Zero direct".to_owned(),
+            peer_access.as_field().to_owned(),
+            render_peer_route_short(route).to_owned(),
+            "not measured".to_owned(),
+        ]);
+    }
+    if facts.is_empty() {
+        return Vec::new();
+    }
+
+    let widths = std::array::from_fn::<_, 5, _>(|index| {
+        facts
+            .iter()
+            .map(|fact| fact[index].len())
+            .chain(std::iter::once(P2P_FACT_HEADERS[index].len()))
+            .max()
+            .unwrap_or(P2P_FACT_HEADERS[index].len())
+    });
+    let header = P2P_FACT_HEADERS
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
+        .collect::<Vec<_>>()
+        .join("  ")
+        .trim_end()
+        .to_owned();
+    let mut lines = vec![
+        String::new(),
+        paint(color, "\u{1b}[1;36m", "P2P path facts"),
+        format!("  {}", paint(color, "\u{1b}[2m", &header)),
+    ];
+    for fact in facts {
+        let topology = format!("{:<width$}", fact[3], width = widths[3]);
+        lines.push(format!(
+            "  {:<w0$}  {:<w1$}  {:<w2$}  {}  {}",
+            fact[0],
+            fact[1],
+            fact[2],
+            paint(color, "\u{1b}[36m", &topology),
+            paint(color, "\u{1b}[33m", &fact[4]),
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2]
+        ));
+    }
+    lines
+}
+
+fn append_summary_notes(lines: &mut Vec<String>, cases: &[BenchCase], color: ColorMode) {
+    let has_direct = cases
+        .iter()
+        .any(|case| matches!(case.operation, Operation::Direct { .. }));
+    let has_staged = cases
+        .iter()
+        .any(|case| matches!(case.operation, Operation::ExplicitStaged { .. }));
+    if has_direct {
+        lines.push(String::new());
+        lines.push(paint(
+            color,
+            "\u{1b}[2m",
+            "  direct: one Level Zero copy request; peer access is the API capability result",
+        ));
+        lines.push(paint(
+            color,
+            "\u{1b}[2m",
+            "  physical P2P: not measured unless a platform trace or traffic counter is collected",
+        ));
+    }
+    if has_staged {
+        lines.push(paint(
+            color,
+            "\u{1b}[2m",
+            "  staged: D2H, synchronize, then H2D; payload rate covers both legs, copy-traffic rate is 2x",
+        ));
+    }
+    if has_direct {
+        lines.push(paint(
+            color,
+            "\u{1b}[2m",
+            "  TP roofline: use the median as an isolated directional pair ceiling; collectives may be lower",
+        ));
+    }
+}
+
+fn summary_row(case: &BenchCase) -> SummaryRow {
+    let (median, spread, mad, outliers, mild_outliers, severe_outliers, skipped) =
+        match &case.outcome {
+            CaseOutcome::Measured {
+                time_summary,
+                summary,
+                ..
+            } => {
+                let [p5, median_with_unit, p95] =
+                    format_rate_triplet([summary.p5, summary.median, summary.p95]);
+                let median = if matches!(case.operation, Operation::ExplicitStaged { .. }) {
+                    format!(
+                        "{} payload / {} copy traffic",
+                        rate_number(&median_with_unit),
+                        format_nonzero_metric(summary.median * 2.0, 1)
+                    )
+                } else {
+                    rate_number(&median_with_unit).to_owned()
+                };
+                let mild = time_summary.outliers.counts.mild;
+                let severe = time_summary.outliers.counts.severe;
+                (
+                    median,
+                    format!("{}..{}", rate_number(&p5), rate_number(&p95)),
+                    format_nonzero_metric(summary.mad, 1),
+                    format!("{}/{}", mild + severe, time_summary.count),
+                    mild,
+                    severe,
+                    false,
+                )
+            }
+            CaseOutcome::Skipped { .. } => (
+                "SKIPPED".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+                0,
+                0,
+                true,
+            ),
+        };
+
+    SummaryRow {
+        transfer: summary_transfer(case),
+        path: summary_path(case),
+        queues: summary_queues(case),
+        median,
+        spread,
+        mad,
+        outliers,
+        mild_outliers,
+        severe_outliers,
+        skipped,
+    }
+}
+
+fn summary_row_fields(row: &SummaryRow) -> [&str; 7] {
+    [
+        &row.transfer,
+        &row.path,
+        &row.queues,
+        &row.median,
+        &row.spread,
+        &row.mad,
+        &row.outliers,
+    ]
+}
+
+fn summary_transfer(case: &BenchCase) -> String {
+    match case.transfer_class {
+        TransferClass::H2D => format!("H2D {} -> {}", case.source, case.destination),
+        TransferClass::D2H => format!("D2H {} -> {}", case.source, case.destination),
+        TransferClass::D2DSameDevice => format!("D2D same {}", case.source),
+        TransferClass::D2DDirect => {
+            format!("D2D direct {} -> {}", case.source, case.destination)
+        }
+        TransferClass::D2DStaged => {
+            format!("D2D staged {} -> {}", case.source, case.destination)
+        }
+    }
+}
+
+fn summary_path(case: &BenchCase) -> String {
+    match &case.operation {
+        Operation::HostToDevice | Operation::DeviceToHost => "pinned host".to_owned(),
+        Operation::SameDevice => "device memory".to_owned(),
+        Operation::Direct { .. } => "direct copy".to_owned(),
+        Operation::ExplicitStaged { .. } => "pinned host (2 legs)".to_owned(),
+    }
+}
+
+fn summary_queues(case: &BenchCase) -> String {
+    let first = if let Some(group) = &case.selected_group {
+        format!("{} ({})", group.ordinal, render_queue_flags(group.flags))
+    } else if case.streams.is_empty() {
+        "-".to_owned()
+    } else {
+        render_streams_compact(&case.streams)
+    };
+
+    if case.second_phase_streams.is_empty() {
+        first
+    } else {
+        format!(
+            "{first} / {}",
+            render_streams_compact(&case.second_phase_streams)
+        )
+    }
+}
+
+fn rate_number(rate: &str) -> &str {
+    rate.strip_suffix(" GB/s").unwrap_or(rate)
 }
 
 pub(crate) fn status_label_from_case_id(id: &str) -> String {
@@ -85,8 +545,8 @@ pub(crate) fn status_label_from_case_id(id: &str) -> String {
     let queue_scope = parts
         .next()
         .map(|part| match part.strip_prefix("group-") {
-            Some(id) => format!(" / group {id}"),
-            None if part == "all-copy-groups" => " / all copy groups".to_owned(),
+            Some(id) => format!(" / engine {id}"),
+            None if part == "all-copy-groups" => " / all copy engines".to_owned(),
             None => String::new(),
         })
         .unwrap_or_default();
@@ -145,62 +605,20 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 }
 
 fn render_case_lines(case: &BenchCase, options: &TextOptions) -> Vec<String> {
-    let mut lines = Vec::new();
-    let label = case_label(case);
-    lines.push(paint(options.color, "\u{1b}[1m", &label));
-    let execution = match case.mode {
-        crate::cli::BenchMode::Single => case.selected_group.as_ref().map_or_else(
-            || format_bytes(case.byte_count),
-            |group| {
-                format!(
-                    "{} on {} queue group {}",
-                    format_bytes(case.byte_count),
-                    render_queue_flags(group.flags),
-                    group.ordinal
-                )
-            },
-        ),
-        crate::cli::BenchMode::Saturation => format!(
-            "{} total across {} queue streams",
-            format_bytes(case.byte_count),
-            case.streams.len()
-        ),
+    let mut lines = vec![paint(options.color, "\u{1b}[1m", &case_label(case))];
+    lines.push(paint(options.color, "\u{1b}[1;36m", "  Transfer"));
+    append_transfer_details(&mut lines, case);
+    lines.push(String::new());
+    let path_heading = if matches!(
+        case.operation,
+        Operation::Direct { .. } | Operation::ExplicitStaged { .. }
+    ) {
+        "  P2P evidence"
+    } else {
+        "  Copy path"
     };
-    lines.push(format!(
-        "  {execution}  [{}, {} samples, {} warm-up]",
-        render_timing(case.timing),
-        case.requested_samples,
-        format_duration(case.warmup)
-    ));
-    lines.push(format!("  {}", render_link_inline(&case.pcie_link)));
-    lines.push(format!(
-        "  config      mode={} class={} allocation={} bytes={} streams={}",
-        case.mode,
-        case.transfer_class,
-        case.allocation,
-        case.byte_count,
-        render_streams(&case.streams)
-    ));
-    if !case.second_phase_streams.is_empty() {
-        lines.push(format!(
-            "  phase 2     streams={}; barrier=after-phase-1-all",
-            render_streams(&case.second_phase_streams)
-        ));
-    }
-    if case.mode == crate::cli::BenchMode::Saturation {
-        lines.push(format!(
-            "  traffic     {} logical payload; {} submitted copy bytes",
-            format_bytes(case.byte_count),
-            format_bytes(submitted_copy_bytes(case))
-        ));
-    }
-
-    if let Operation::Direct { peer_access } = &case.operation {
-        lines.push(format!(
-            "  path        direct Level Zero copy; peer access {}; physical route not inferred",
-            peer_access.as_field()
-        ));
-    }
+    lines.push(paint(options.color, "\u{1b}[1;36m", path_heading));
+    append_path_evidence(&mut lines, case);
 
     match &case.outcome {
         CaseOutcome::Measured {
@@ -228,6 +646,132 @@ fn render_case_lines(case: &BenchCase, options: &TextOptions) -> Vec<String> {
     lines
 }
 
+fn append_transfer_details(lines: &mut Vec<String>, case: &BenchCase) {
+    push_detail(lines, "payload", format_bytes(case.byte_count));
+    let mode = match case.mode {
+        crate::cli::BenchMode::Single => "single queue".to_owned(),
+        crate::cli::BenchMode::Saturation => format!(
+            "saturation across {} {}; payload partitioned across queues",
+            case.streams.len(),
+            plural(case.streams.len(), "queue", "queues")
+        ),
+    };
+    push_detail(lines, "mode", mode);
+    let queue_label = if case.second_phase_streams.is_empty() {
+        "queues"
+    } else {
+        "source queues"
+    };
+    push_detail(lines, queue_label, render_streams(&case.streams));
+    if !case.second_phase_streams.is_empty() {
+        push_detail(
+            lines,
+            "destination queues",
+            format!(
+                "{}; starts after source queues finish",
+                render_streams(&case.second_phase_streams)
+            ),
+        );
+    }
+    push_detail(lines, "memory", render_allocation(case.allocation));
+    push_detail(
+        lines,
+        "timing",
+        format!(
+            "{}, {} samples, {} warm-up",
+            render_timing(case.timing),
+            case.requested_samples,
+            format_duration(case.warmup)
+        ),
+    );
+    if submitted_copy_bytes(case) != case.byte_count {
+        push_detail(
+            lines,
+            "copy traffic",
+            format!(
+                "{} submitted for {} logical payload",
+                format_bytes(submitted_copy_bytes(case)),
+                format_bytes(case.byte_count)
+            ),
+        );
+    }
+}
+
+fn append_path_evidence(lines: &mut Vec<String>, case: &BenchCase) {
+    match &case.operation {
+        Operation::Direct { peer_access, route } => {
+            push_detail(lines, "copy request", "direct GPU-memory copy (Level Zero)");
+            push_detail(
+                lines,
+                "peer access",
+                format!(
+                    "{} (zeDeviceCanAccessPeer = {})",
+                    render_peer_support(peer_access),
+                    peer_access.as_field(),
+                ),
+            );
+            push_detail(lines, "PCIe topology", render_peer_route(route));
+            push_detail(lines, "host staging", "none requested by xfer");
+            push_detail(
+                lines,
+                "physical P2P",
+                "not measured; requires platform counters or tracing",
+            );
+            if let Some(stream) = case.verification_stream {
+                push_detail(
+                    lines,
+                    "verification",
+                    format!(
+                        "{}, engine {} / queue {}; outside timing",
+                        case.destination, stream.group_ordinal, stream.queue_index
+                    ),
+                );
+            }
+        }
+        Operation::ExplicitStaged { route } => {
+            push_detail(lines, "copy request", "GPU -> pinned host -> GPU");
+            push_detail(lines, "synchronization", "wait between D2H and H2D legs");
+            push_detail(
+                lines,
+                "PCIe topology",
+                format!("{}; direct peer route not used", render_peer_route(route)),
+            );
+            push_detail(lines, "host staging", "yes, explicitly requested by xfer");
+            push_detail(lines, "physical P2P", "no; transfer is host-staged");
+        }
+        Operation::HostToDevice => {
+            push_detail(lines, "copy request", "pinned host -> GPU memory");
+        }
+        Operation::DeviceToHost => {
+            push_detail(lines, "copy request", "GPU memory -> pinned host");
+        }
+        Operation::SameDevice => {
+            push_detail(lines, "copy request", "copy between allocations on one GPU");
+        }
+    }
+}
+
+fn push_detail(lines: &mut Vec<String>, label: &str, value: impl std::fmt::Display) {
+    const LABEL_WIDTH: usize = 20;
+    lines.push(format!("    {label:<LABEL_WIDTH$}{value}"));
+}
+
+fn render_peer_support(access: &PeerAccess) -> &'static str {
+    match access {
+        PeerAccess::Yes => "supported",
+        PeerAccess::No => "not supported",
+        PeerAccess::Unknown(_) => "unknown",
+    }
+}
+
+fn render_allocation(allocation: super::model::AllocationKind) -> &'static str {
+    match allocation {
+        super::model::AllocationKind::PinnedHost => "pinned host + device memory",
+        super::model::AllocationKind::Device => "device memory",
+        super::model::AllocationKind::PinnedStaging => "device memory + pinned host staging",
+    }
+}
+
 fn render_measured_lines(
     case: &BenchCase,
     time_summary: &Summary,
@@ -246,7 +790,12 @@ fn render_measured_lines(
         summary.median,
         summary.median_confidence.upper_bound,
     ]);
-    let [heading, time, throughput] = estimate_table(time, throughput, options.color);
+    let rate_label = if matches!(case.operation, Operation::ExplicitStaged { .. }) {
+        "payload"
+    } else {
+        "throughput"
+    };
+    let [heading, time, throughput] = estimate_table(time, throughput, rate_label, options.color);
     lines.extend([heading, time, throughput]);
     lines.push(paint(
         options.color,
@@ -258,6 +807,12 @@ fn render_measured_lines(
             summary.median_confidence.resamples
         ),
     ));
+    if matches!(case.operation, Operation::ExplicitStaged { .. }) {
+        lines.push(format!(
+            "  copy traffic median {} GB/s (2 submitted bytes per logical payload byte)",
+            format_nonzero_metric(summary.median * 2.0, 1)
+        ));
+    }
 
     let [p5, _, p95] = format_rate_triplet([summary.p5, summary.median, summary.p95]);
     lines.push(format!("  sample       p5 {p5}, p95 {p95}"));
@@ -406,6 +961,39 @@ fn render_timing(timing: crate::cli::TimingMode) -> &'static str {
     }
 }
 
+fn render_peer_route(route: &PeerRoute) -> String {
+    match route {
+        PeerRoute::SameRootPort { root_port } => {
+            format!("same root port {root_port}")
+        }
+        PeerRoute::SharedUpstreamBridge { common_bridge } => {
+            format!("shared upstream bridge {common_bridge}")
+        }
+        PeerRoute::DifferentRootPorts {
+            host_bridge,
+            source_root_port,
+            destination_root_port,
+        } => format!(
+            "different root ports {source_root_port} -> {destination_root_port} on {host_bridge}"
+        ),
+        PeerRoute::CrossHostBridges {
+            source_host_bridge,
+            destination_host_bridge,
+        } => format!("different host bridges {source_host_bridge} -> {destination_host_bridge}"),
+        PeerRoute::Unknown(reason) => format!("topology unknown: {reason}"),
+    }
+}
+
+fn render_peer_route_short(route: &PeerRoute) -> &'static str {
+    match route {
+        PeerRoute::SameRootPort { .. } => "same root port",
+        PeerRoute::SharedUpstreamBridge { .. } => "shared upstream",
+        PeerRoute::DifferentRootPorts { .. } => "different root ports",
+        PeerRoute::CrossHostBridges { .. } => "different host bridges",
+        PeerRoute::Unknown(_) => "unknown",
+    }
+}
+
 fn render_queue_flags(flags: QueueFlags) -> &'static str {
     match (flags.copy, flags.compute) {
         (true, true) => "compute+copy",
@@ -424,15 +1012,52 @@ fn render_queue_count(count: u32) -> String {
 }
 
 fn render_streams(streams: &[QueueStreamInfo]) -> String {
+    if streams.is_empty() {
+        return "-".to_owned();
+    }
+
     streams
         .iter()
-        .map(|stream| format!("g{}:q{}", stream.group_ordinal, stream.queue_index))
+        .map(|stream| {
+            format!(
+                "engine {} / queue {} ({})",
+                stream.group_ordinal,
+                stream.queue_index,
+                render_queue_flags(stream.flags)
+            )
+        })
         .collect::<Vec<_>>()
-        .join(",")
+        .join("; ")
+}
+
+fn render_streams_compact(streams: &[QueueStreamInfo]) -> String {
+    let mut groups = Vec::<(u32, usize)>::new();
+    for stream in streams {
+        if let Some((_, count)) = groups
+            .iter_mut()
+            .find(|(group, _)| *group == stream.group_ordinal)
+        {
+            *count += 1;
+        } else {
+            groups.push((stream.group_ordinal, 1));
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|(group, count)| {
+            if count == 1 {
+                group.to_string()
+            } else {
+                format!("{group} ({count} queues)")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn submitted_copy_bytes(case: &BenchCase) -> u64 {
-    if matches!(case.operation, Operation::ExplicitStaged) {
+    if matches!(case.operation, Operation::ExplicitStaged { .. }) {
         case.byte_count.saturating_mul(2)
     } else {
         case.byte_count
@@ -457,7 +1082,12 @@ fn format_seconds_triplet(values: [f64; 3]) -> [String; 3] {
     format_triplet(values, 2, format_seconds_with_decimals)
 }
 
-fn estimate_table(time: [String; 3], throughput: [String; 3], color: ColorMode) -> [String; 3] {
+fn estimate_table(
+    time: [String; 3],
+    throughput: [String; 3],
+    rate_label: &str,
+    color: ColorMode,
+) -> [String; 3] {
     const LABEL_WIDTH: usize = 12;
     const VALUE_GAP: &str = "  ";
 
@@ -485,7 +1115,7 @@ fn estimate_table(time: [String; 3], throughput: [String; 3], color: ColorMode) 
         )
     };
 
-    [heading, row("time", time), row("throughput", throughput)]
+    [heading, row("time", time), row(rate_label, throughput)]
 }
 
 fn format_seconds_with_decimals(seconds: f64, decimals: usize) -> String {
@@ -564,8 +1194,14 @@ fn trim_decimal_zeros(value: &str) -> String {
 
 fn sanitize_human_text(value: &str) -> String {
     value
-        .replace("queue group ordinal ", "queue group ")
-        .replace(" ordinal ", " queue group ")
+        .replace("queue group ordinal ", "engine ")
+        .replace("queue-group ordinals", "engine IDs")
+        .replace("queue group ", "engine ")
+        .replace(" ordinal ", " engine ")
+}
+
+fn plural<'word>(count: usize, singular: &'word str, plural: &'word str) -> &'word str {
+    if count == 1 { singular } else { plural }
 }
 
 fn paint(color: ColorMode, code: &str, text: &str) -> String {
@@ -588,8 +1224,8 @@ mod tests {
     use crate::cli::{TimingMode, TransferClass};
     use crate::output::{
         AllocationKind, BenchCase, BenchReport, CaseOutcome, ColorMode, DeviceInfo, Endpoint,
-        LinkInfo, ListReport, Operation, PeerAccess, PeerAccessInfo, QueueFlags, QueueGroupInfo,
-        TextOptions,
+        LinkInfo, ListReport, Operation, PeerAccess, PeerAccessInfo, PeerRoute, QueueFlags,
+        QueueGroupInfo, TextOptions,
     };
     use crate::stats;
 
@@ -617,6 +1253,7 @@ mod tests {
                 },
             }],
             second_phase_streams: Vec::new(),
+            verification_stream: None,
             transfer_class: TransferClass::D2H,
             operation: Operation::DeviceToHost,
             source: Endpoint::Device(0),
@@ -646,15 +1283,22 @@ mod tests {
     #[test]
     fn renders_measured_text_with_benchmark_details_and_no_ordinal() {
         let report = BenchReport {
+            system: crate::output::test_system(1),
             cases: vec![measured_case()],
         };
         let output = render_bench_text(&report, &TextOptions::default());
 
+        assert!(output.starts_with("System under test\n"));
+        assert_eq!(output.matches("System under test").count(), 1);
+        assert!(output.contains("Host  Test CPU"));
+        assert!(output.contains("dev0  Test GPU"));
+        assert!(output.contains("PCI 0000:01:00.0 | Gen5 x16 | 63 GB/s theoretical"));
         assert!(output.contains("D2H dev0 -> pinned host"));
-        assert!(
-            output.contains("256 MiB on copy queue group 1  [wall clock, 5 samples, 1 s warm-up]")
-        );
-        assert!(output.contains("negotiated PCIe Gen5 x16, 63 GB/s theoretical"));
+        assert!(output.contains("Transfer"));
+        assert!(output.contains("payload             256 MiB"));
+        assert!(output.contains("queues              engine 1 / queue 0 (copy)"));
+        assert!(output.contains("timing              wall clock, 5 samples, 1 s warm-up"));
+        assert!(output.contains("Copy path"));
         assert!(output.contains("time"));
         assert!(output.contains("throughput"));
         assert!(output.contains("81% of negotiated PCIe theoretical"));
@@ -672,6 +1316,7 @@ mod tests {
             &case,
             &TextOptions {
                 include_histogram: false,
+                summary_only: false,
                 color: ColorMode::Never,
             },
         );
@@ -691,6 +1336,7 @@ mod tests {
             &case,
             &TextOptions {
                 include_histogram: false,
+                summary_only: false,
                 color: ColorMode::Never,
             },
         );
@@ -706,6 +1352,7 @@ mod tests {
             &case,
             &TextOptions {
                 include_histogram: false,
+                summary_only: false,
                 color: ColorMode::Never,
             },
         );
@@ -740,6 +1387,7 @@ mod tests {
                 "13.819 GB/s".to_owned(),
                 "13.823 GB/s".to_owned(),
             ],
+            "throughput",
             ColorMode::Never,
         );
 
@@ -754,12 +1402,14 @@ mod tests {
     #[test]
     fn omits_histogram_when_requested() {
         let report = BenchReport {
+            system: crate::output::test_system(1),
             cases: vec![measured_case()],
         };
         let output = render_bench_text(
             &report,
             &TextOptions {
                 include_histogram: false,
+                summary_only: false,
                 color: ColorMode::Never,
             },
         );
@@ -768,11 +1418,92 @@ mod tests {
     }
 
     #[test]
+    fn summary_only_distinguishes_direct_and_explicit_staged_paths() {
+        let mut direct = measured_case();
+        direct.transfer_class = TransferClass::D2DDirect;
+        direct.operation = Operation::Direct {
+            peer_access: PeerAccess::Yes,
+            route: PeerRoute::CrossHostBridges {
+                source_host_bridge: "pci0000:0a".to_owned(),
+                destination_host_bridge: "pci0000:61".to_owned(),
+            },
+        };
+        direct.source = Endpoint::Device(0);
+        direct.destination = Endpoint::Device(1);
+        direct.allocation = AllocationKind::Device;
+        direct.pcie_link = LinkInfo::Unknown {
+            reason: "cross-device".to_owned(),
+        };
+
+        let mut staged = direct.clone();
+        staged.transfer_class = TransferClass::D2DStaged;
+        staged.operation = Operation::ExplicitStaged {
+            route: PeerRoute::CrossHostBridges {
+                source_host_bridge: "pci0000:0a".to_owned(),
+                destination_host_bridge: "pci0000:61".to_owned(),
+            },
+        };
+        staged.allocation = AllocationKind::PinnedStaging;
+        staged.second_phase_streams = staged.streams.clone();
+
+        let output = render_bench_text(
+            &BenchReport {
+                system: crate::output::test_system(2),
+                cases: vec![direct, staged],
+            },
+            &TextOptions {
+                include_histogram: true,
+                summary_only: true,
+                color: ColorMode::Never,
+            },
+        );
+
+        assert!(output.starts_with("System under test\n"));
+        assert_eq!(output.matches("System under test").count(), 1);
+        assert!(output.contains("Run summary"));
+        assert!(output.contains("D2D direct dev0 -> dev1"));
+        assert!(output.contains("P2P path facts"));
+        assert!(output.contains("Level Zero direct"));
+        assert!(output.contains("not measured"));
+        assert!(!output.contains("unverified"));
+        assert!(output.contains("D2D staged dev0 -> dev1"));
+        assert!(output.contains("pinned host"));
+        assert!(output.contains("51.2 payload / 102.4 copy traffic"));
+        assert!(output.contains("direct: one Level Zero copy request"));
+        assert!(output.contains("staged: D2H, synchronize, then H2D"));
+        assert!(!output.contains("distribution"));
+        assert!(!output.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn multi_case_detailed_text_ends_with_summary() {
+        let report = BenchReport {
+            system: crate::output::test_system(1),
+            cases: vec![measured_case(), measured_case()],
+        };
+        let output = render_bench_text(
+            &report,
+            &TextOptions {
+                include_histogram: false,
+                summary_only: false,
+                color: ColorMode::Never,
+            },
+        );
+
+        assert_eq!(output.matches("Run summary").count(), 1);
+        assert_eq!(output.matches("System under test").count(), 1);
+        assert_eq!(output.matches("Transfer").count(), 2);
+        assert!(!output.contains("config      mode="));
+        assert!(output.rfind("Run summary") > output.rfind("D2H dev0 -> pinned host"));
+    }
+
+    #[test]
     fn ansi_histogram_uses_unicode_bars_and_median_marker() {
         let output = render_case_text(
             &measured_case(),
             &TextOptions {
                 include_histogram: true,
+                summary_only: false,
                 color: ColorMode::Ansi,
             },
         );
@@ -786,6 +1517,7 @@ mod tests {
     #[test]
     fn skipped_direct_text_separates_observation_peer_access_and_path_inference() {
         let report = BenchReport {
+            system: crate::output::test_system(2),
             cases: vec![BenchCase {
                 mode: crate::cli::BenchMode::Single,
                 selected_group: Some(QueueGroupInfo {
@@ -805,9 +1537,22 @@ mod tests {
                     },
                 }],
                 second_phase_streams: Vec::new(),
+                verification_stream: Some(crate::output::QueueStreamInfo {
+                    group_ordinal: 1,
+                    queue_index: 0,
+                    flags: QueueFlags {
+                        copy: true,
+                        compute: false,
+                    },
+                }),
                 transfer_class: TransferClass::D2DDirect,
                 operation: Operation::Direct {
                     peer_access: PeerAccess::No,
+                    route: PeerRoute::DifferentRootPorts {
+                        host_bridge: "pci0000:00".to_owned(),
+                        source_root_port: "0000:00:01.0".to_owned(),
+                        destination_root_port: "0000:00:02.0".to_owned(),
+                    },
                 },
                 source: Endpoint::Device(0),
                 destination: Endpoint::Device(1),
@@ -829,16 +1574,18 @@ mod tests {
 
         let text = render_bench_text(&report, &TextOptions::default());
         assert!(text.contains("D2D direct dev0 -> dev1"));
-        assert!(text.contains("compute+copy queue group 0"));
-        assert!(text.contains("direct Level Zero copy"));
-        assert!(text.contains("peer access no"));
-        assert!(text.contains("physical route not inferred"));
-        assert!(text.contains("queue group 0 does not advertise copy capability"));
+        assert!(text.contains("engine 0 / queue 0 (compute+copy)"));
+        assert!(text.contains("direct GPU-memory copy (Level Zero)"));
+        assert!(text.contains("not supported (zeDeviceCanAccessPeer = no)"));
+        assert!(text.contains("different root ports"));
+        assert!(text.contains("physical P2P        not measured"));
+        assert!(text.contains("host staging        none requested by xfer"));
+        assert!(text.contains("engine 0 does not advertise copy capability"));
         assert!(!text.contains("ordinal"));
     }
 
     #[test]
-    fn renders_list_text_with_queue_group_names() {
+    fn renders_list_text_with_plain_engine_names() {
         let report = ListReport {
             devices: vec![DeviceInfo {
                 index: 0,
@@ -862,12 +1609,15 @@ mod tests {
                 from_device: 0,
                 to_device: 1,
                 access: PeerAccess::Yes,
+                route: PeerRoute::SharedUpstreamBridge {
+                    common_bridge: "0000:02:00.0".to_owned(),
+                },
             }],
         };
 
         let text = render_list(&report);
         assert!(text.contains("dev0  Intel GPU"));
-        assert!(text.contains("queue group 1 (copy, 1 queue)"));
+        assert!(text.contains("engine 1 (copy, 1 queue)"));
         assert!(text.contains("dev0 -> dev1  yes"));
         assert!(!text.contains("ordinal"));
     }
@@ -878,7 +1628,7 @@ mod tests {
             status_label_from_case_id(
                 "d2d-direct/dev0-to-dev1/256MiB/group-2/wall-clock/single-streams-1"
             ),
-            "D2D direct dev0 -> dev1 / group 2"
+            "D2D direct dev0 -> dev1 / engine 2"
         );
     }
 }

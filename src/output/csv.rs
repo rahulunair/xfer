@@ -1,8 +1,8 @@
 use super::model::{
-    BenchCase, BenchReport, CaseOutcome, Endpoint, LinkInfo, Operation, QueueStreamInfo,
+    BenchCase, BenchReport, CaseOutcome, Endpoint, LinkInfo, Operation, PeerRoute, QueueStreamInfo,
 };
 
-pub const BENCH_CSV_HEADER: &str = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_ordinal,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason,benchmark_mode,stream_count,queue_streams,second_phase_stream_count,second_phase_queue_streams,logical_payload_bytes,submitted_copy_bytes,submission_policy,staging_barrier";
+pub const BENCH_CSV_HEADER: &str = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_ordinal,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason,benchmark_mode,stream_count,queue_streams,second_phase_stream_count,second_phase_queue_streams,logical_payload_bytes,submitted_copy_bytes,submission_policy,staging_barrier,peer_route_class,peer_route_detail,true_p2p_status,rate_basis,submitted_copy_median_gb_s,verification_queue_stream";
 
 pub fn render_bench_csv(report: &BenchReport) -> String {
     let mut lines = Vec::with_capacity(report.cases.len() + 1);
@@ -84,6 +84,18 @@ pub fn render_case_csv(case: &BenchCase) -> String {
     fields.push(submitted_copy_bytes(case).to_string());
     fields.push(submission_policy(case).to_owned());
     fields.push(staging_barrier(case).to_owned());
+    fields.push(render_peer_route_class(&case.operation).to_owned());
+    fields.push(render_peer_route_detail(&case.operation));
+    fields.push(render_true_p2p_status(&case.operation).to_owned());
+    fields.push(render_rate_basis(&case.operation).to_owned());
+    fields.push(summary.map_or_else(String::new, |summary| {
+        format_float(summary.median * f64::from(submitted_copy_multiplier(case)))
+    }));
+    fields.push(
+        case.verification_stream
+            .as_ref()
+            .map_or_else(String::new, |stream| render_streams(&[*stream])),
+    );
 
     fields
         .into_iter()
@@ -101,10 +113,15 @@ fn render_streams(streams: &[QueueStreamInfo]) -> String {
 }
 
 fn submitted_copy_bytes(case: &BenchCase) -> u64 {
-    if matches!(case.operation, Operation::ExplicitStaged) {
-        case.byte_count.saturating_mul(2)
+    case.byte_count
+        .saturating_mul(u64::from(submitted_copy_multiplier(case)))
+}
+
+fn submitted_copy_multiplier(case: &BenchCase) -> u32 {
+    if matches!(case.operation, Operation::ExplicitStaged { .. }) {
+        2
     } else {
-        case.byte_count
+        1
     }
 }
 
@@ -116,7 +133,7 @@ fn submission_policy(case: &BenchCase) -> &'static str {
 }
 
 fn staging_barrier(case: &BenchCase) -> &'static str {
-    if matches!(case.operation, Operation::ExplicitStaged) {
+    if matches!(case.operation, Operation::ExplicitStaged { .. }) {
         "after-d2h-all"
     } else {
         ""
@@ -140,17 +157,77 @@ fn render_operation_field(operation: &Operation) -> &'static str {
         Operation::DeviceToHost => "d2h-pinned",
         Operation::SameDevice => "same-device",
         Operation::Direct { .. } => "direct",
-        Operation::ExplicitStaged => "explicit-staged",
+        Operation::ExplicitStaged { .. } => "explicit-staged",
     }
 }
 
 fn render_peer_access_field(operation: &Operation) -> &str {
     match operation {
-        Operation::Direct { peer_access } => peer_access.as_field(),
+        Operation::Direct { peer_access, .. } => peer_access.as_field(),
         Operation::HostToDevice
         | Operation::DeviceToHost
         | Operation::SameDevice
-        | Operation::ExplicitStaged => "",
+        | Operation::ExplicitStaged { .. } => "",
+    }
+}
+
+fn operation_peer_route(operation: &Operation) -> Option<&PeerRoute> {
+    match operation {
+        Operation::Direct { route, .. } | Operation::ExplicitStaged { route } => Some(route),
+        Operation::HostToDevice | Operation::DeviceToHost | Operation::SameDevice => None,
+    }
+}
+
+fn render_peer_route_class(operation: &Operation) -> &'static str {
+    match operation_peer_route(operation) {
+        Some(PeerRoute::SameRootPort { .. }) => "same-root-port",
+        Some(PeerRoute::SharedUpstreamBridge { .. }) => "shared-upstream-bridge",
+        Some(PeerRoute::DifferentRootPorts { .. }) => "different-root-ports",
+        Some(PeerRoute::CrossHostBridges { .. }) => "cross-host-bridge",
+        Some(PeerRoute::Unknown(_)) => "unknown",
+        None => "",
+    }
+}
+
+fn render_peer_route_detail(operation: &Operation) -> String {
+    match operation_peer_route(operation) {
+        Some(PeerRoute::SameRootPort { root_port }) => format!("root_port={root_port}"),
+        Some(PeerRoute::SharedUpstreamBridge { common_bridge }) => {
+            format!("common_bridge={common_bridge}")
+        }
+        Some(PeerRoute::DifferentRootPorts {
+            host_bridge,
+            source_root_port,
+            destination_root_port,
+        }) => format!(
+            "host_bridge={host_bridge};source_root_port={source_root_port};destination_root_port={destination_root_port}"
+        ),
+        Some(PeerRoute::CrossHostBridges {
+            source_host_bridge,
+            destination_host_bridge,
+        }) => format!(
+            "source_host_bridge={source_host_bridge};destination_host_bridge={destination_host_bridge}"
+        ),
+        Some(PeerRoute::Unknown(reason)) => reason.clone(),
+        None => String::new(),
+    }
+}
+
+fn render_true_p2p_status(operation: &Operation) -> &'static str {
+    match operation {
+        Operation::Direct { .. } => "not-measured",
+        Operation::ExplicitStaged { .. } => "no-host-staged",
+        Operation::HostToDevice | Operation::DeviceToHost | Operation::SameDevice => {
+            "not-applicable"
+        }
+    }
+}
+
+fn render_rate_basis(operation: &Operation) -> &'static str {
+    if matches!(operation, Operation::ExplicitStaged { .. }) {
+        "end-to-end-logical-payload"
+    } else {
+        "payload"
     }
 }
 
@@ -225,6 +302,7 @@ mod tests {
                 },
             }],
             second_phase_streams: Vec::new(),
+            verification_stream: None,
             transfer_class: TransferClass::D2H,
             operation: Operation::DeviceToHost,
             source: Endpoint::Device(0),
@@ -254,7 +332,7 @@ mod tests {
             .split(',')
             .collect::<Vec<_>>();
 
-        assert_eq!(columns.len(), 37);
+        assert_eq!(columns.len(), 43);
         assert_eq!(&columns[..legacy.len()], legacy);
         assert_eq!(columns[0], "status");
         assert_eq!(columns[1], "transfer_class");
@@ -262,6 +340,10 @@ mod tests {
         assert_eq!(columns[27], "skip_reason");
         assert_eq!(columns[28], "benchmark_mode");
         assert_eq!(columns[36], "staging_barrier");
+        assert_eq!(columns[37], "peer_route_class");
+        assert_eq!(columns[39], "true_p2p_status");
+        assert_eq!(columns[41], "submitted_copy_median_gb_s");
+        assert_eq!(columns[42], "verification_queue_stream");
     }
 
     #[test]
@@ -278,7 +360,10 @@ mod tests {
         case.pcie_link = LinkInfo::Unknown {
             reason: "bad, \"quoted\" path".to_owned(),
         };
-        let report = BenchReport { cases: vec![case] };
+        let report = BenchReport {
+            system: crate::output::test_system(1),
+            cases: vec![case],
+        };
 
         let csv = render_bench_csv(&report);
         let lines = csv.lines().collect::<Vec<_>>();
@@ -288,7 +373,7 @@ mod tests {
             split_csv_record(lines[0]).len(),
             split_csv_record(lines[1]).len()
         );
-        assert_eq!(split_csv_record(lines[0]).len(), 37);
+        assert_eq!(split_csv_record(lines[0]).len(), 43);
         assert!(lines[1].contains("\"unknown:bad, \"\"quoted\"\" path\""));
         assert!(!csv.contains("\u{1b}["));
     }
@@ -296,6 +381,7 @@ mod tests {
     #[test]
     fn skipped_direct_csv_is_machine_readable() {
         let report = BenchReport {
+            system: crate::output::test_system(2),
             cases: vec![BenchCase {
                 mode: crate::cli::BenchMode::Single,
                 selected_group: Some(QueueGroupInfo {
@@ -315,9 +401,21 @@ mod tests {
                     },
                 }],
                 second_phase_streams: Vec::new(),
+                verification_stream: Some(crate::output::QueueStreamInfo {
+                    group_ordinal: 1,
+                    queue_index: 0,
+                    flags: QueueFlags {
+                        copy: true,
+                        compute: false,
+                    },
+                }),
                 transfer_class: TransferClass::D2DDirect,
                 operation: Operation::Direct {
                     peer_access: crate::output::PeerAccess::No,
+                    route: crate::output::PeerRoute::CrossHostBridges {
+                        source_host_bridge: "pci0000:0a".to_owned(),
+                        destination_host_bridge: "pci0000:61".to_owned(),
+                    },
                 },
                 source: Endpoint::Device(0),
                 destination: Endpoint::Device(1),
@@ -338,6 +436,9 @@ mod tests {
         let csv = render_bench_csv(&report);
         assert!(csv.contains("skipped,d2d-direct,direct,no,dev0,dev1"));
         assert!(csv.contains("peer access unsupported"));
+        let fields = split_csv_record(csv.lines().nth(1).expect("data row"));
+        assert_eq!(fields[37], "cross-host-bridge");
+        assert_eq!(fields[39], "not-measured");
     }
 
     #[test]
@@ -369,7 +470,9 @@ mod tests {
     fn staged_saturation_csv_reports_both_phases_and_copy_traffic() {
         let mut case = measured_case();
         case.mode = crate::cli::BenchMode::Saturation;
-        case.operation = Operation::ExplicitStaged;
+        case.operation = Operation::ExplicitStaged {
+            route: crate::output::PeerRoute::Unknown("test".to_owned()),
+        };
         case.second_phase_streams = vec![crate::output::QueueStreamInfo {
             group_ordinal: 3,
             queue_index: 1,
@@ -385,6 +488,17 @@ mod tests {
         assert_eq!(fields[32], "g3:q1");
         assert_eq!(fields[34], case.byte_count.saturating_mul(2).to_string());
         assert_eq!(fields[36], "after-d2h-all");
+        assert_eq!(fields[37], "unknown");
+        assert_eq!(fields[38], "test");
+        assert_eq!(fields[39], "no-host-staged");
+        assert_eq!(fields[40], "end-to-end-logical-payload");
+        assert_eq!(
+            fields[41],
+            format_float(match &case.outcome {
+                CaseOutcome::Measured { summary, .. } => summary.median * 2.0,
+                CaseOutcome::Skipped { .. } => 0.0,
+            })
+        );
     }
 
     fn split_csv_record(line: &str) -> Vec<String> {

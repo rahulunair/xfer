@@ -383,13 +383,23 @@ fn measure_direct(
         context.create_command_list(&source.device, plan.single_group_ordinal()),
         "create source command list",
     )?;
+    let verification_stream = plan.verification_stream.as_ref().ok_or_else(|| {
+        CaseExecutionError::Skip(format!(
+            "destination dev{} has no copy-capable engine for verification",
+            destination.index
+        ))
+    })?;
     let destination_queue = ze_fatal(
-        context.create_command_queue(&destination.device, plan.single_group_ordinal()),
-        "create destination command queue",
+        context.create_command_queue_at(
+            &destination.device,
+            verification_stream.group_ordinal,
+            verification_stream.queue_index,
+        ),
+        "create destination verification queue",
     )?;
     let destination_list = ze_fatal(
-        context.create_command_list(&destination.device, plan.single_group_ordinal()),
-        "create destination command list",
+        context.create_command_list(&destination.device, verification_stream.group_ordinal),
+        "create destination verification command list",
     )?;
     let mut host = ze_fatal(
         context.alloc_host(bytes, ALLOCATION_ALIGNMENT),

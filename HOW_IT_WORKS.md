@@ -26,8 +26,9 @@ number.
 ## Single-transfer mode
 
 `xfer bench` creates one command queue at queue index 0 for each selected Level
-Zero queue group. One sample records one copy, submits it, synchronizes its
-queue, verifies the result, and retains the elapsed duration.
+Zero engine group. Human output calls this an `engine`; the Level Zero API
+calls it a command queue group. One sample records one copy, submits it,
+synchronizes its queue, verifies the result, and retains the elapsed duration.
 
 The transfer classes are:
 
@@ -48,10 +49,10 @@ the host staging buffer.
 aggregate bandwidth is observed when the available copy-capable queues are kept
 busy together?
 
-Without `--queue-group`, saturation mode selects every queue index in every
-queue group that advertises Level Zero copy capability. With
-`--queue-group N`, it selects every queue index in that group. It does not claim
-that a queue is a distinct physical copy engine.
+Without `--engine`, saturation mode selects every queue index in every group
+that advertises Level Zero copy capability. With `--engine N`, it selects every
+queue index in that group. It does not claim that a queue is a distinct
+physical copy engine. `--queue-group` remains a compatibility alias.
 
 `--size` remains one total logical payload per sample. The payload is divided
 into balanced, non-overlapping regions, one per selected queue stream. For
@@ -82,18 +83,19 @@ Saturation supports wall-clock timing only. Independent queues do not provide
 one Level Zero device-timestamp interval that represents the aggregate
 operation, so `--saturation --device-timestamps` is rejected.
 
-## Queue identity
+## Engine identity
 
 Level Zero exposes command queue groups. Each group has:
 
-- a group ordinal;
+- a numeric group ID, called an ordinal by the Level Zero API;
 - capability flags such as copy and compute;
 - a count of queue indices that can be created in that group.
 
-`xfer list` reports all three. A stream such as `g1:q2` means queue-group
-ordinal 1, queue index 2. These identifiers are API topology, not proof of a
+Human output calls the group ID an engine ID and prints queue indices in words,
+for example `engine 1 / queue 2`. CSV retains API-oriented field names for
+compatibility. These identifiers describe API topology, not proof of a
 specific blitter or other physical engine. `xfer` never silently changes a
-requested group.
+requested engine.
 
 ## Warm-up and samples
 
@@ -143,7 +145,9 @@ negotiated PCIe generation and width. The theoretical payload rate accounts for
 PCIe line encoding:
 
 - Gen1 and Gen2 use 8b/10b encoding.
-- Gen3 and newer use 128b/130b encoding.
+- Gen3 through Gen5 use 128b/130b encoding.
+- Gen6 and Gen7 use the 242/256 FLIT payload ratio used by this reference
+  calculation.
 
 The percentage shown is measured rate divided by this negotiated payload
 ceiling. It is not based on product marketing specifications. If the Level Zero
@@ -162,6 +166,17 @@ allocations owned by different devices. `peer-access=yes` or `no` is a separate
 capability result. Neither observation proves whether the physical path was
 device-to-device, traversed a host bridge, or was internally staged by the
 driver. A Level Zero trace or platform counter is required to prove the route.
+
+The reported PCIe topology is derived from endpoint ancestry in sysfs. It
+distinguishes a common root port, a shared upstream bridge, different root
+ports, different host bridges, and unknown topology. This attachment
+classification is not physical transfer-path proof and does not identify an
+upstream bridge as a PCIe switch without stronger evidence.
+
+Destination poisoning and verification use a destination copy-capable engine
+selected independently from the measured source engine. These operations are
+outside the timed interval. A direct case therefore is not rejected merely
+because source and destination engine IDs differ.
 
 `explicit-staged` has a narrower meaning: `xfer` itself issued D2H and H2D legs
 through pinned host memory with an explicit barrier between them.
@@ -221,4 +236,6 @@ model tokens per second, or end-to-end training/inference performance. Those
 workloads add synchronization, kernels, topology-aware routing, protocol
 thresholds, and framework overhead. `xfer` supplies a lower-level transfer
 baseline that helps determine whether the transport foundation is already
-underperforming.
+underperforming. Pair cases run one at a time, so their direct medians are
+isolated directional pair ceilings, not concurrent multi-GPU collective
+rooflines.

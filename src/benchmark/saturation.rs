@@ -313,7 +313,11 @@ fn measure_direct(
         .map_err(CaseExecutionError::Fatal)?;
     let context = ze_fatal(driver.create_context(), "create saturation context")?;
     let streams = StreamSet::new(&context, source_device, &plan.streams)?;
-    let verify_stream = verification_stream(&context, destination_device)?;
+    let verify_stream = verification_stream(
+        &context,
+        destination_device,
+        plan.verification_stream.as_ref(),
+    )?;
     let chunks = streams.chunks(bytes)?;
     let mut host = alloc_host(&context, bytes, "allocate saturation direct verification")?;
     let source = alloc_device(
@@ -606,23 +610,24 @@ fn prepare_h2d_streams(
 fn verification_stream<'context>(
     context: &'context ze::Context<'_>,
     device: &DeviceRecord,
+    selected: Option<&QueueStreamInfo>,
 ) -> std::result::Result<QueueStream<'context>, CaseExecutionError> {
-    let group = device
-        .queues
-        .iter()
-        .find(|group| group.info.flags.copy)
-        .ok_or_else(|| {
-            CaseExecutionError::Skip(format!(
-                "dev{} has no copy-capable queue for verification",
-                device.index
-            ))
-        })?;
+    let selected = selected.ok_or_else(|| {
+        CaseExecutionError::Skip(format!(
+            "dev{} has no copy-capable engine for verification",
+            device.index
+        ))
+    })?;
     let queue = ze_fatal(
-        context.create_command_queue_at(&device.device, group.info.ordinal, 0),
+        context.create_command_queue_at(
+            &device.device,
+            selected.group_ordinal,
+            selected.queue_index,
+        ),
         "create saturation verification queue",
     )?;
     let list = ze_fatal(
-        context.create_command_list(&device.device, group.info.ordinal),
+        context.create_command_list(&device.device, selected.group_ordinal),
         "create saturation verification command list",
     )?;
     Ok(QueueStream { queue, list })

@@ -6,8 +6,11 @@ use crate::cli::OutputFormat;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use super::csv::{BENCH_CSV_HEADER, render_case_csv};
-use super::model::TextOptions;
-use super::text::{format_duration, render_case_text, status_label_from_case_id};
+use super::model::{SystemInfo, TextOptions};
+use super::text::{
+    format_duration, render_case_text, render_summary_text, render_system_text,
+    status_label_from_case_id,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusMode {
@@ -79,13 +82,21 @@ where
     R: Report,
 {
     fn event(&mut self, event: BenchEvent<'_>) -> io::Result<()> {
+        let topology = match &event {
+            BenchEvent::TopologyPlanned { system, case_count } => {
+                Some((system.devices.len(), *case_count))
+            }
+            _ => None,
+        };
+        if let Some((device_count, case_count)) = topology {
+            self.progress.finish_and_clear();
+            self.inner.event(event)?;
+            self.spinner(topology_message(device_count, case_count));
+            return Ok(());
+        }
+
         match &event {
-            BenchEvent::TopologyPlanned {
-                device_count,
-                case_count,
-            } => self.spinner(format!(
-                "Topology planned: {device_count} devices, {case_count} cases"
-            )),
+            BenchEvent::TopologyPlanned { .. } => unreachable!("handled above"),
             BenchEvent::CaseStart { id, index, total } => self.spinner(format!(
                 "Benchmarking {} ({index}/{total})",
                 status_label_from_case_id(id.as_str())
@@ -126,8 +137,10 @@ where
             } => {
                 self.progress.reset();
                 self.progress.set_style(self.complete_style.clone());
-                self.progress.finish_with_message(format!(
-                    "Complete: {case_count} cases, {measured_count} measured, {skipped_count} skipped"
+                self.progress.finish_with_message(completion_message(
+                    *case_count,
+                    *measured_count,
+                    *skipped_count,
                 ));
             }
         }
@@ -143,7 +156,14 @@ pub struct LiveReporter<W, E> {
     text_options: TextOptions,
     status_mode: StatusMode,
     progress_enabled: bool,
+    output_state: OutputState,
+    summary_cases: Vec<crate::output::BenchCase>,
+}
+
+#[derive(Default)]
+struct OutputState {
     wrote_csv_header: bool,
+    wrote_system: bool,
     wrote_text_case: bool,
 }
 
@@ -166,8 +186,8 @@ where
             text_options,
             status_mode,
             progress_enabled: status_mode != StatusMode::Disabled,
-            wrote_csv_header: false,
-            wrote_text_case: false,
+            output_state: OutputState::default(),
+            summary_cases: Vec::new(),
         }
     }
 
@@ -176,28 +196,31 @@ where
     }
 
     fn emit_csv_header(&mut self) -> io::Result<()> {
-        if self.wrote_csv_header {
+        if self.output_state.wrote_csv_header {
             return Ok(());
         }
 
         self.stdout.write_all(BENCH_CSV_HEADER.as_bytes())?;
         self.stdout.write_all(b"\n")?;
         self.stdout.flush()?;
-        self.wrote_csv_header = true;
+        self.output_state.wrote_csv_header = true;
         Ok(())
     }
 
     fn emit_case(&mut self, case: &crate::output::BenchCase) -> io::Result<()> {
         match self.format {
             OutputFormat::Text => {
+                if self.text_options.summary_only {
+                    return Ok(());
+                }
                 self.clear_interactive_status()?;
-                if self.wrote_text_case {
+                if self.output_state.wrote_text_case {
                     self.stdout.write_all(b"\n")?;
                 }
                 self.stdout
                     .write_all(render_case_text(case, &self.text_options).as_bytes())?;
                 self.stdout.flush()?;
-                self.wrote_text_case = true;
+                self.output_state.wrote_text_case = true;
                 Ok(())
             }
             OutputFormat::Csv => {
@@ -207,6 +230,37 @@ where
                 self.stdout.flush()
             }
         }
+    }
+
+    fn emit_system(&mut self, system: &SystemInfo) -> io::Result<()> {
+        if self.format != OutputFormat::Text || self.output_state.wrote_system {
+            return Ok(());
+        }
+
+        self.clear_interactive_status()?;
+        self.stdout
+            .write_all(render_system_text(system, self.text_options.color).as_bytes())?;
+        self.stdout.flush()?;
+        self.output_state.wrote_system = true;
+        Ok(())
+    }
+
+    fn emit_summary(&mut self) -> io::Result<()> {
+        if self.format != OutputFormat::Text
+            || (!self.text_options.summary_only && self.summary_cases.len() <= 1)
+        {
+            return Ok(());
+        }
+
+        self.clear_interactive_status()?;
+        if self.output_state.wrote_text_case {
+            self.stdout.write_all(b"\n")?;
+        }
+        let summary = render_summary_text(&self.summary_cases, &self.text_options);
+        self.stdout.write_all(summary.as_bytes())?;
+        self.stdout.flush()?;
+        self.output_state.wrote_text_case = true;
+        Ok(())
     }
 
     fn status(&mut self, message: &str) -> io::Result<()> {
@@ -277,13 +331,11 @@ where
 {
     fn event(&mut self, event: BenchEvent<'_>) -> io::Result<()> {
         match event {
-            BenchEvent::TopologyPlanned {
-                device_count,
-                case_count,
-            } => match self.format {
-                OutputFormat::Text => self.status(&format!(
-                    "Topology planned: {device_count} devices, {case_count} cases"
-                )),
+            BenchEvent::TopologyPlanned { system, case_count } => match self.format {
+                OutputFormat::Text => {
+                    self.emit_system(system)?;
+                    self.status(&topology_message(system.devices.len(), case_count))
+                }
                 OutputFormat::Csv => self.emit_csv_header(),
             },
             BenchEvent::CaseStart { id, index, total } => self.status(&format!(
@@ -327,17 +379,44 @@ where
                 status_label_from_case_id(id.as_str())
             )),
             BenchEvent::CaseComplete { case, .. } | BenchEvent::CaseSkipped { case, .. } => {
+                if self.format == OutputFormat::Text {
+                    self.summary_cases.push(case.clone());
+                }
                 self.emit_case(case)
             }
             BenchEvent::RunComplete {
                 case_count,
                 measured_count,
                 skipped_count,
-            } => self.finish_status(&format!(
-                "Complete: {case_count} cases, {measured_count} measured, {skipped_count} skipped"
-            )),
+            } => {
+                self.emit_summary()?;
+                self.finish_status(&completion_message(
+                    case_count,
+                    measured_count,
+                    skipped_count,
+                ))
+            }
         }
     }
+}
+
+fn topology_message(device_count: usize, case_count: usize) -> String {
+    format!(
+        "Topology planned: {device_count} {}, {case_count} {}",
+        plural(device_count, "device", "devices"),
+        plural(case_count, "case", "cases")
+    )
+}
+
+fn completion_message(case_count: usize, measured_count: usize, skipped_count: usize) -> String {
+    format!(
+        "Complete: {case_count} {}, {measured_count} measured, {skipped_count} skipped",
+        plural(case_count, "case", "cases")
+    )
+}
+
+fn plural<'word>(count: usize, singular: &'word str, plural: &'word str) -> &'word str {
+    if count == 1 { singular } else { plural }
 }
 
 fn progress_bar(completed: u32, total: u32) -> String {
@@ -388,6 +467,7 @@ mod tests {
                 },
             }],
             second_phase_streams: Vec::new(),
+            verification_stream: None,
             transfer_class: TransferClass::H2D,
             operation: Operation::HostToDevice,
             source: Endpoint::Host,
@@ -413,12 +493,14 @@ mod tests {
         let id =
             CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
         let case = measured_case();
+        let system = crate::output::test_system(1);
         let mut reporter = LiveReporter::new(
             Vec::new(),
             Vec::new(),
             OutputFormat::Text,
             TextOptions {
                 include_histogram: false,
+                summary_only: false,
                 color: ColorMode::Never,
             },
             StatusMode::Interactive,
@@ -426,7 +508,7 @@ mod tests {
 
         reporter
             .event(BenchEvent::TopologyPlanned {
-                device_count: 1,
+                system: &system,
                 case_count: 1,
             })
             .expect("topology");
@@ -447,10 +529,12 @@ mod tests {
         let (stdout, stderr) = reporter.into_inner();
         let stdout = String::from_utf8(stdout).expect("stdout utf8");
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
-        assert!(stdout.starts_with("H2D pinned host -> dev0"));
-        assert!(stdout.contains("copy queue group 2"));
+        assert!(stdout.starts_with("System under test\n"));
+        assert_eq!(stdout.matches("System under test").count(), 1);
+        assert!(stdout.contains("H2D pinned host -> dev0"));
+        assert!(stdout.contains("engine 2 / queue 0 (copy)"));
         assert!(stderr.contains("\r\u{1b}[2KTopology planned"));
-        assert!(stderr.contains("\r\u{1b}[2KBenchmarking H2D host -> dev0 / group 2"));
+        assert!(stderr.contains("\r\u{1b}[2KBenchmarking H2D host -> dev0 / engine 2"));
         assert!(stderr.ends_with("\r\u{1b}[2K"));
         assert!(!stderr.contains("ordinal"));
     }
@@ -459,6 +543,7 @@ mod tests {
     fn non_tty_status_uses_newline_lifecycle() {
         let id =
             CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
+        let system = crate::output::test_system(1);
         let mut reporter = LiveReporter::new(
             Vec::new(),
             Vec::new(),
@@ -469,7 +554,7 @@ mod tests {
 
         reporter
             .event(BenchEvent::TopologyPlanned {
-                device_count: 1,
+                system: &system,
                 case_count: 1,
             })
             .expect("topology");
@@ -508,7 +593,7 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         assert_eq!(
             stderr,
-            "Topology planned: 1 devices, 1 cases\nBenchmarking H2D host -> dev0 / group 2 (1/1)\nBenchmarking H2D host -> dev0 / group 2: Warming up for 10 ms\nBenchmarking H2D host -> dev0 / group 2: Collecting 3 samples in estimated 30 ms\nBenchmarking H2D host -> dev0 / group 2: Analyzing\nComplete: 1 cases, 1 measured, 0 skipped\n"
+            "Topology planned: 1 device, 1 case\nBenchmarking H2D host -> dev0 / engine 2 (1/1)\nBenchmarking H2D host -> dev0 / engine 2: Warming up for 10 ms\nBenchmarking H2D host -> dev0 / engine 2: Collecting 3 samples in estimated 30 ms\nBenchmarking H2D host -> dev0 / engine 2: Analyzing\nComplete: 1 case, 1 measured, 0 skipped\n"
         );
     }
 
@@ -536,7 +621,7 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr utf8");
         assert_eq!(
             stderr,
-            "\r\u{1b}[2KBenchmarking H2D host -> dev0 / group 2: Collecting [==========          ] 25/50 samples"
+            "\r\u{1b}[2KBenchmarking H2D host -> dev0 / engine 2: Collecting [==========          ] 25/50 samples"
         );
     }
 
@@ -545,6 +630,7 @@ mod tests {
         let id =
             CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
         let case = measured_case();
+        let system = crate::output::test_system(1);
         let mut reporter = LiveReporter::new(
             Vec::new(),
             Vec::new(),
@@ -555,7 +641,7 @@ mod tests {
 
         reporter
             .event(BenchEvent::TopologyPlanned {
-                device_count: 1,
+                system: &system,
                 case_count: 1,
             })
             .expect("topology");
@@ -587,6 +673,56 @@ mod tests {
         assert_eq!(stdout.lines().count(), 2);
         assert!(stderr.is_empty());
         assert!(!stdout.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn summary_only_emits_one_copy_safe_table_at_run_completion() {
+        let id =
+            CaseId::new("h2d/host-to-dev0/1KiB/group-2/wall-clock/single-streams-1".to_owned());
+        let case = measured_case();
+        let system = crate::output::test_system(1);
+        let mut reporter = LiveReporter::new(
+            Vec::new(),
+            Vec::new(),
+            OutputFormat::Text,
+            TextOptions {
+                include_histogram: true,
+                summary_only: true,
+                color: ColorMode::Never,
+            },
+            StatusMode::Disabled,
+        );
+
+        reporter
+            .event(BenchEvent::TopologyPlanned {
+                system: &system,
+                case_count: 1,
+            })
+            .expect("topology");
+        reporter
+            .event(BenchEvent::CaseComplete {
+                id: &id,
+                case: &case,
+            })
+            .expect("case complete");
+        reporter
+            .event(BenchEvent::RunComplete {
+                case_count: 1,
+                measured_count: 1,
+                skipped_count: 0,
+            })
+            .expect("run complete");
+
+        let (stdout, stderr) = reporter.into_inner();
+        let stdout = String::from_utf8(stdout).expect("stdout utf8");
+        assert!(stdout.starts_with("System under test\n"));
+        assert_eq!(stdout.matches("System under test").count(), 1);
+        assert!(stdout.contains("Run summary"));
+        assert!(stdout.contains("H2D host -> dev0"));
+        assert!(!stdout.contains("config      mode="));
+        assert!(!stdout.contains("distribution"));
+        assert!(!stdout.contains("\u{1b}["));
+        assert!(stderr.is_empty());
     }
 
     #[test]
