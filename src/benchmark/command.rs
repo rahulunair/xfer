@@ -93,10 +93,9 @@ pub(crate) fn sample_d2d(
     plan: &CasePlan,
 ) -> std::result::Result<Duration, CaseExecutionError> {
     match timing {
-        TimingMode::WallClock if matches!(plan.operation, Operation::Direct { .. }) => ze_fatal(
-            time_d2d_sync(queue, list, dst, src, bytes),
-            "sample direct device-to-device copy",
-        ),
+        TimingMode::WallClock if matches!(plan.operation, Operation::Direct { .. }) => {
+            time_direct_d2d_sync(queue, list, dst, src, bytes)
+        }
         TimingMode::WallClock => ze_fatal(
             time_d2d_sync(queue, list, dst, src, bytes),
             "sample device-to-device copy",
@@ -132,6 +131,26 @@ pub(crate) fn sample_d2d(
             timestamp_duration(event, properties, plan)
         }
     }
+}
+
+fn time_direct_d2d_sync(
+    queue: &ze::CommandQueue<'_>,
+    list: &ze::CommandList<'_>,
+    dst: &ze::DeviceAllocation<'_>,
+    src: &ze::DeviceAllocation<'_>,
+    bytes: usize,
+) -> std::result::Result<Duration, CaseExecutionError> {
+    prepare_d2d_list(list, dst, src, bytes, None).map_err(|error| {
+        timestamp_level_zero_error("record direct device-to-device copy", error)
+    })?;
+    let started = Instant::now();
+    queue.execute(&[list]).map_err(|error| {
+        timestamp_level_zero_error("execute direct device-to-device copy", error)
+    })?;
+    queue.synchronize(QUEUE_SYNC_TIMEOUT_NS).map_err(|error| {
+        timestamp_level_zero_error("synchronize direct device-to-device copy", error)
+    })?;
+    Ok(started.elapsed())
 }
 
 pub(crate) fn create_timestamp_pool<'context>(

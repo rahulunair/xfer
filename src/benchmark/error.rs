@@ -114,14 +114,9 @@ fn phase_allows_capability_skip(phase: &str) -> bool {
             | "execute timestamped host-to-device copy"
             | "execute timestamped device-to-host copy"
             | "execute timestamped device-to-device copy"
-            | "synchronize timestamped host-to-device copy"
-            | "synchronize timestamped device-to-host copy"
-            | "synchronize timestamped device-to-device copy"
             | "query timestamp event"
-            | "sample direct device-to-device copy"
             | "record direct device-to-device copy"
             | "execute direct device-to-device copy"
-            | "synchronize direct device-to-device copy"
     )
 }
 
@@ -145,5 +140,13 @@ mod tests {
     fn capability_skip_is_phase_aware() {
         assert!(capability_skip_reason(&unavailable("create timestamp event pool")).is_some());
         assert!(capability_skip_reason(&unavailable("allocate device destination")).is_none());
+        assert!(
+            capability_skip_reason(&unavailable("synchronize timestamped host-to-device copy"))
+                .is_none()
+        );
+        assert!(
+            capability_skip_reason(&unavailable("synchronize direct device-to-device copy"))
+                .is_none()
+        );
     }
 }

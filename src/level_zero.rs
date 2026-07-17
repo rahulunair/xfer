@@ -1,11 +1,13 @@
 #![allow(unsafe_code, clippy::borrow_as_ptr, clippy::missing_errors_doc)]
 
+use std::cell::Cell;
 use std::error::Error as StdError;
 use std::ffi::c_void;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
+use std::rc::Rc;
 
 #[allow(
     clippy::all,
@@ -43,6 +45,13 @@ pub enum LevelZeroError {
         src_len: usize,
     },
     DeviceDriverMismatch,
+    IncompatibleObjects {
+        operation: &'static str,
+        reason: &'static str,
+    },
+    SubmissionStateUnknown {
+        operation: &'static str,
+    },
 }
 
 impl fmt::Display for LevelZeroError {
@@ -66,6 +75,16 @@ impl fmt::Display for LevelZeroError {
             Self::DeviceDriverMismatch => {
                 f.write_str("Level Zero device does not belong to the context's driver")
             }
+            Self::IncompatibleObjects { operation, reason } => {
+                write!(
+                    f,
+                    "{operation} received incompatible Level Zero objects: {reason}"
+                )
+            }
+            Self::SubmissionStateUnknown { operation } => write!(
+                f,
+                "{operation} was not attempted because queue completion is unconfirmed"
+            ),
         }
     }
 }
@@ -370,10 +389,49 @@ pub fn enumerate_gpus() -> Result<Vec<Device>> {
     Ok(devices)
 }
 
+#[derive(Debug, Default)]
+struct ContextState {
+    active_queues: Cell<usize>,
+    poisoned: Cell<bool>,
+}
+
+impl ContextState {
+    fn mark_submitted(&self, queue_was_pending: bool) {
+        if !queue_was_pending {
+            self.active_queues
+                .set(self.active_queues.get().saturating_add(1));
+        }
+    }
+
+    fn mark_synchronized(&self, queue_was_pending: bool) {
+        if queue_was_pending {
+            self.active_queues
+                .set(self.active_queues.get().saturating_sub(1));
+        }
+    }
+
+    fn poison(&self) {
+        self.poisoned.set(true);
+    }
+
+    fn release_is_safe(&self) -> bool {
+        !self.poisoned.get() && self.active_queues.get() == 0
+    }
+
+    fn require_release_safe(&self, operation: &'static str) -> Result<()> {
+        if self.release_is_safe() {
+            Ok(())
+        } else {
+            Err(LevelZeroError::SubmissionStateUnknown { operation })
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Context<'driver> {
     handle: raw::ze_context_handle_t,
     driver: raw::ze_driver_handle_t,
+    state: Rc<ContextState>,
     _driver: PhantomData<&'driver Driver>,
 }
 
@@ -399,6 +457,7 @@ impl<'driver> Context<'driver> {
         Ok(Self {
             handle,
             driver: driver.handle,
+            state: Rc::new(ContextState::default()),
             _driver: PhantomData,
         })
     }
@@ -450,24 +509,24 @@ impl<'driver> Context<'driver> {
     }
 
     fn destroy(&mut self) -> Result<()> {
-        if self.handle.is_null() {
+        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
+        if handle.is_null() {
             return Ok(());
         }
+        self.state.require_release_safe("zeContextDestroy")?;
 
         let result = unsafe {
-            // SAFETY: self.handle is an owned context handle that has not yet been destroyed.
-            raw::zeContextDestroy(self.handle)
+            // SAFETY: handle is the owned context handle and this wrapper attempts release only once.
+            raw::zeContextDestroy(handle)
         };
-        check("zeContextDestroy", result)?;
-        self.handle = ptr::null_mut();
-        Ok(())
+        check("zeContextDestroy", result)
     }
 }
 
 impl Drop for Context<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy() {
-            eprintln!("xfer: {error}");
+            report_drop_error(&error);
         }
     }
 }
@@ -475,6 +534,11 @@ impl Drop for Context<'_> {
 #[derive(Debug)]
 pub struct CommandQueue<'context> {
     handle: raw::ze_command_queue_handle_t,
+    context: raw::ze_context_handle_t,
+    device: raw::ze_device_handle_t,
+    queue_group_ordinal: u32,
+    pending: Cell<bool>,
+    context_state: Rc<ContextState>,
     _context: PhantomData<&'context Context<'context>>,
 }
 
@@ -508,11 +572,38 @@ impl<'context> CommandQueue<'context> {
 
         Ok(Self {
             handle,
+            context: context.handle(),
+            device: device.handle(),
+            queue_group_ordinal,
+            pending: Cell::new(false),
+            context_state: Rc::clone(&context.state),
             _context: PhantomData,
         })
     }
 
     pub fn execute(&self, lists: &[&CommandList<'_>]) -> Result<()> {
+        self.context_state
+            .require_release_safe("zeCommandQueueExecuteCommandLists")?;
+        for list in lists {
+            if self.context != list.context {
+                return Err(LevelZeroError::IncompatibleObjects {
+                    operation: "zeCommandQueueExecuteCommandLists",
+                    reason: "queue and command list have different contexts",
+                });
+            }
+            if self.device != list.device {
+                return Err(LevelZeroError::IncompatibleObjects {
+                    operation: "zeCommandQueueExecuteCommandLists",
+                    reason: "queue and command list target different devices",
+                });
+            }
+            if self.queue_group_ordinal != list.queue_group_ordinal {
+                return Err(LevelZeroError::IncompatibleObjects {
+                    operation: "zeCommandQueueExecuteCommandLists",
+                    reason: "queue and command list use different engine IDs",
+                });
+            }
+        }
         let count = len_to_u32("zeCommandQueueExecuteCommandLists", lists.len())?;
         let mut handles = lists.iter().map(|list| list.handle()).collect::<Vec<_>>();
         let result = unsafe {
@@ -524,7 +615,17 @@ impl<'context> CommandQueue<'context> {
                 ptr::null_mut(),
             )
         };
-        check("zeCommandQueueExecuteCommandLists", result)
+        match check("zeCommandQueueExecuteCommandLists", result) {
+            Ok(()) => {
+                let was_pending = self.pending.replace(true);
+                self.context_state.mark_submitted(was_pending);
+                Ok(())
+            }
+            Err(error) => {
+                self.context_state.poison();
+                Err(error)
+            }
+        }
     }
 
     pub fn synchronize(&self, timeout_ns: u64) -> Result<()> {
@@ -532,7 +633,17 @@ impl<'context> CommandQueue<'context> {
             // SAFETY: self.handle is a valid command queue handle; timeout is passed by value.
             raw::zeCommandQueueSynchronize(self.handle, timeout_ns)
         };
-        check("zeCommandQueueSynchronize", result)
+        match check("zeCommandQueueSynchronize", result) {
+            Ok(()) => {
+                let was_pending = self.pending.replace(false);
+                self.context_state.mark_synchronized(was_pending);
+                Ok(())
+            }
+            Err(error) => {
+                self.context_state.poison();
+                Err(error)
+            }
+        }
     }
 
     pub fn close(mut self) -> Result<()> {
@@ -540,24 +651,25 @@ impl<'context> CommandQueue<'context> {
     }
 
     fn destroy(&mut self) -> Result<()> {
-        if self.handle.is_null() {
+        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
+        if handle.is_null() {
             return Ok(());
         }
+        self.context_state
+            .require_release_safe("zeCommandQueueDestroy")?;
 
         let result = unsafe {
-            // SAFETY: self.handle is an owned command queue handle that has not yet been destroyed.
-            raw::zeCommandQueueDestroy(self.handle)
+            // SAFETY: handle is the owned queue handle and this wrapper attempts release only once.
+            raw::zeCommandQueueDestroy(handle)
         };
-        check("zeCommandQueueDestroy", result)?;
-        self.handle = ptr::null_mut();
-        Ok(())
+        check("zeCommandQueueDestroy", result)
     }
 }
 
 impl Drop for CommandQueue<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy() {
-            eprintln!("xfer: {error}");
+            report_drop_error(&error);
         }
     }
 }
@@ -565,6 +677,10 @@ impl Drop for CommandQueue<'_> {
 #[derive(Debug)]
 pub struct CommandList<'context> {
     handle: raw::ze_command_list_handle_t,
+    context: raw::ze_context_handle_t,
+    device: raw::ze_device_handle_t,
+    queue_group_ordinal: u32,
+    context_state: Rc<ContextState>,
     _context: PhantomData<&'context Context<'context>>,
 }
 
@@ -595,11 +711,17 @@ impl<'context> CommandList<'context> {
 
         Ok(Self {
             handle,
+            context: context.handle(),
+            device: device.handle(),
+            queue_group_ordinal,
+            context_state: Rc::clone(&context.state),
             _context: PhantomData,
         })
     }
 
     pub fn close(&self) -> Result<()> {
+        self.context_state
+            .require_release_safe("zeCommandListClose")?;
         let result = unsafe {
             // SAFETY: self.handle is a valid open command list handle.
             raw::zeCommandListClose(self.handle)
@@ -608,6 +730,8 @@ impl<'context> CommandList<'context> {
     }
 
     pub fn reset(&self) -> Result<()> {
+        self.context_state
+            .require_release_safe("zeCommandListReset")?;
         let result = unsafe {
             // SAFETY: self.handle is a valid command list handle that the caller is not submitting concurrently.
             raw::zeCommandListReset(self.handle)
@@ -629,6 +753,12 @@ impl<'context> CommandList<'context> {
         signal: Option<&Event<'_>>,
         wait_events: &[&Event<'_>],
     ) -> Result<()> {
+        self.context_state
+            .require_release_safe("zeCommandListAppendMemoryCopy")?;
+        self.ensure_context(dst.context, "zeCommandListAppendMemoryCopy(destination)")?;
+        self.ensure_context(src.context, "zeCommandListAppendMemoryCopy(source)")?;
+        self.ensure_device(dst.device, "zeCommandListAppendMemoryCopy(destination)")?;
+        self.ensure_event_contexts(signal, wait_events)?;
         unsafe {
             // SAFETY: forwarded from this function's caller contract.
             self.append_memory_copy_raw(
@@ -657,6 +787,12 @@ impl<'context> CommandList<'context> {
         signal: Option<&Event<'_>>,
         wait_events: &[&Event<'_>],
     ) -> Result<()> {
+        self.context_state
+            .require_release_safe("zeCommandListAppendMemoryCopy")?;
+        self.ensure_context(dst.context, "zeCommandListAppendMemoryCopy(destination)")?;
+        self.ensure_context(src.context, "zeCommandListAppendMemoryCopy(source)")?;
+        self.ensure_device(src.device, "zeCommandListAppendMemoryCopy(source)")?;
+        self.ensure_event_contexts(signal, wait_events)?;
         unsafe {
             // SAFETY: forwarded from this function's caller contract.
             self.append_memory_copy_raw(
@@ -685,6 +821,12 @@ impl<'context> CommandList<'context> {
         signal: Option<&Event<'_>>,
         wait_events: &[&Event<'_>],
     ) -> Result<()> {
+        self.context_state
+            .require_release_safe("zeCommandListAppendMemoryCopy")?;
+        self.ensure_context(dst.context, "zeCommandListAppendMemoryCopy(destination)")?;
+        self.ensure_context(src.context, "zeCommandListAppendMemoryCopy(source)")?;
+        self.ensure_device(src.device, "zeCommandListAppendMemoryCopy(source)")?;
+        self.ensure_event_contexts(signal, wait_events)?;
         unsafe {
             // SAFETY: forwarded from this function's caller contract.
             self.append_memory_copy_raw(
@@ -705,6 +847,55 @@ impl<'context> CommandList<'context> {
 
     fn handle(&self) -> raw::ze_command_list_handle_t {
         self.handle
+    }
+
+    fn ensure_context(
+        &self,
+        context: raw::ze_context_handle_t,
+        operation: &'static str,
+    ) -> Result<()> {
+        if self.context == context {
+            Ok(())
+        } else {
+            Err(LevelZeroError::IncompatibleObjects {
+                operation,
+                reason: "command list and resource have different contexts",
+            })
+        }
+    }
+
+    fn ensure_event_contexts(
+        &self,
+        signal: Option<&Event<'_>>,
+        wait_events: &[&Event<'_>],
+    ) -> Result<()> {
+        if signal.is_some_and(|event| event.context != self.context)
+            || wait_events
+                .iter()
+                .any(|event| event.context != self.context)
+        {
+            Err(LevelZeroError::IncompatibleObjects {
+                operation: "zeCommandListAppendMemoryCopy",
+                reason: "command list and event have different contexts",
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_device(
+        &self,
+        device: raw::ze_device_handle_t,
+        operation: &'static str,
+    ) -> Result<()> {
+        if self.device == device {
+            Ok(())
+        } else {
+            Err(LevelZeroError::IncompatibleObjects {
+                operation,
+                reason: "command list targets the wrong allocation device",
+            })
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -754,24 +945,25 @@ impl<'context> CommandList<'context> {
     }
 
     fn destroy_inner(&mut self) -> Result<()> {
-        if self.handle.is_null() {
+        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
+        if handle.is_null() {
             return Ok(());
         }
+        self.context_state
+            .require_release_safe("zeCommandListDestroy")?;
 
         let result = unsafe {
-            // SAFETY: self.handle is an owned command list handle that has not yet been destroyed.
-            raw::zeCommandListDestroy(self.handle)
+            // SAFETY: handle is the owned command-list handle and release is attempted only once.
+            raw::zeCommandListDestroy(handle)
         };
-        check("zeCommandListDestroy", result)?;
-        self.handle = ptr::null_mut();
-        Ok(())
+        check("zeCommandListDestroy", result)
     }
 }
 
 impl Drop for CommandList<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy_inner() {
-            eprintln!("xfer: {error}");
+            report_drop_error(&error);
         }
     }
 }
@@ -781,6 +973,7 @@ pub struct HostAllocation<'context> {
     context: raw::ze_context_handle_t,
     ptr: Option<NonNull<c_void>>,
     len: usize,
+    context_state: Rc<ContextState>,
     _context: PhantomData<&'context Context<'context>>,
 }
 
@@ -806,6 +999,7 @@ impl<'context> HostAllocation<'context> {
             context: context.handle(),
             ptr: Some(ptr),
             len: bytes,
+            context_state: Rc::clone(&context.state),
             _context: PhantomData,
         })
     }
@@ -822,6 +1016,10 @@ impl<'context> HostAllocation<'context> {
 
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
+        assert!(
+            self.context_state.release_is_safe(),
+            "host allocation cannot be accessed while queue completion is unconfirmed"
+        );
         unsafe {
             // SAFETY: Level Zero returned a non-null host allocation valid for self.len bytes.
             std::slice::from_raw_parts(self.ptr().as_ptr().cast::<u8>(), self.len)
@@ -830,6 +1028,10 @@ impl<'context> HostAllocation<'context> {
 
     #[must_use]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        assert!(
+            self.context_state.release_is_safe(),
+            "host allocation cannot be accessed while queue completion is unconfirmed"
+        );
         unsafe {
             // SAFETY: &mut self guarantees unique access to the host allocation for self.len bytes.
             std::slice::from_raw_parts_mut(self.ptr().as_ptr().cast::<u8>(), self.len)
@@ -846,24 +1048,23 @@ impl<'context> HostAllocation<'context> {
     }
 
     fn free_inner(&mut self) -> Result<()> {
-        let Some(ptr) = self.ptr else {
+        let Some(ptr) = self.ptr.take() else {
             return Ok(());
         };
+        self.context_state.require_release_safe("zeMemFree(host)")?;
 
         let result = unsafe {
-            // SAFETY: ptr is an owned allocation from self.context that has not yet been freed.
+            // SAFETY: ptr is the owned allocation and this wrapper attempts release only once.
             raw::zeMemFree(self.context, ptr.as_ptr())
         };
-        check("zeMemFree(host)", result)?;
-        self.ptr = None;
-        Ok(())
+        check("zeMemFree(host)", result)
     }
 }
 
 impl Drop for HostAllocation<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.free_inner() {
-            eprintln!("xfer: {error}");
+            report_drop_error(&error);
         }
     }
 }
@@ -871,8 +1072,10 @@ impl Drop for HostAllocation<'_> {
 #[derive(Debug)]
 pub struct DeviceAllocation<'context> {
     context: raw::ze_context_handle_t,
+    device: raw::ze_device_handle_t,
     ptr: Option<NonNull<c_void>>,
     len: usize,
+    context_state: Rc<ContextState>,
     _context: PhantomData<&'context Context<'context>>,
 }
 
@@ -911,8 +1114,10 @@ impl<'context> DeviceAllocation<'context> {
 
         Ok(Self {
             context: context.handle(),
+            device: device.handle(),
             ptr: Some(ptr),
             len: bytes,
+            context_state: Rc::clone(&context.state),
             _context: PhantomData,
         })
     }
@@ -937,24 +1142,24 @@ impl<'context> DeviceAllocation<'context> {
     }
 
     fn free_inner(&mut self) -> Result<()> {
-        let Some(ptr) = self.ptr else {
+        let Some(ptr) = self.ptr.take() else {
             return Ok(());
         };
+        self.context_state
+            .require_release_safe("zeMemFree(device)")?;
 
         let result = unsafe {
-            // SAFETY: ptr is an owned allocation from self.context that has not yet been freed.
+            // SAFETY: ptr is the owned allocation and this wrapper attempts release only once.
             raw::zeMemFree(self.context, ptr.as_ptr())
         };
-        check("zeMemFree(device)", result)?;
-        self.ptr = None;
-        Ok(())
+        check("zeMemFree(device)", result)
     }
 }
 
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.free_inner() {
-            eprintln!("xfer: {error}");
+            report_drop_error(&error);
         }
     }
 }
@@ -962,7 +1167,9 @@ impl Drop for DeviceAllocation<'_> {
 #[derive(Debug)]
 pub struct EventPool<'context> {
     handle: raw::ze_event_pool_handle_t,
+    context: raw::ze_context_handle_t,
     count: u32,
+    context_state: Rc<ContextState>,
     _context: PhantomData<&'context Context<'context>>,
 }
 
@@ -1012,7 +1219,9 @@ impl<'context> EventPool<'context> {
 
         Ok(Self {
             handle,
+            context: context.handle(),
             count,
+            context_state: Rc::clone(&context.state),
             _context: PhantomData,
         })
     }
@@ -1059,6 +1268,8 @@ impl<'context> EventPool<'context> {
 
         Ok(Event {
             handle,
+            context: self.context,
+            context_state: Rc::clone(&self.context_state),
             _pool: PhantomData,
         })
     }
@@ -1068,24 +1279,25 @@ impl<'context> EventPool<'context> {
     }
 
     fn destroy_inner(&mut self) -> Result<()> {
-        if self.handle.is_null() {
+        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
+        if handle.is_null() {
             return Ok(());
         }
+        self.context_state
+            .require_release_safe("zeEventPoolDestroy")?;
 
         let result = unsafe {
-            // SAFETY: self.handle is an owned event pool handle that has not yet been destroyed.
-            raw::zeEventPoolDestroy(self.handle)
+            // SAFETY: handle is the owned event-pool handle and release is attempted only once.
+            raw::zeEventPoolDestroy(handle)
         };
-        check("zeEventPoolDestroy", result)?;
-        self.handle = ptr::null_mut();
-        Ok(())
+        check("zeEventPoolDestroy", result)
     }
 }
 
 impl Drop for EventPool<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy_inner() {
-            eprintln!("xfer: {error}");
+            report_drop_error(&error);
         }
     }
 }
@@ -1093,6 +1305,8 @@ impl Drop for EventPool<'_> {
 #[derive(Debug)]
 pub struct Event<'pool> {
     handle: raw::ze_event_handle_t,
+    context: raw::ze_context_handle_t,
+    context_state: Rc<ContextState>,
     _pool: PhantomData<&'pool EventPool<'pool>>,
 }
 
@@ -1106,6 +1320,8 @@ impl Event<'_> {
     }
 
     pub fn host_reset(&self) -> Result<()> {
+        self.context_state
+            .require_release_safe("zeEventHostReset")?;
         let result = unsafe {
             // SAFETY: self.handle is a valid event handle and the caller is not concurrently using it.
             raw::zeEventHostReset(self.handle)
@@ -1114,6 +1330,8 @@ impl Event<'_> {
     }
 
     pub fn query_kernel_timestamp(&self) -> Result<KernelTimestampResult> {
+        self.context_state
+            .require_release_safe("zeEventQueryKernelTimestamp")?;
         let mut timestamp = kernel_timestamp_result_template();
         let result = unsafe {
             // SAFETY: self.handle is a valid event handle and timestamp is writable output storage.
@@ -1138,25 +1356,33 @@ impl Event<'_> {
     }
 
     fn destroy_inner(&mut self) -> Result<()> {
-        if self.handle.is_null() {
+        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
+        if handle.is_null() {
             return Ok(());
         }
+        self.context_state.require_release_safe("zeEventDestroy")?;
 
         let result = unsafe {
-            // SAFETY: self.handle is an owned event handle that has not yet been destroyed.
-            raw::zeEventDestroy(self.handle)
+            // SAFETY: handle is the owned event handle and release is attempted only once.
+            raw::zeEventDestroy(handle)
         };
-        check("zeEventDestroy", result)?;
-        self.handle = ptr::null_mut();
-        Ok(())
+        check("zeEventDestroy", result)
     }
 }
 
 impl Drop for Event<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy_inner() {
-            eprintln!("xfer: {error}");
+            report_drop_error(&error);
         }
+    }
+}
+
+fn report_drop_error(error: &LevelZeroError) {
+    // The originating submit/synchronize error is reported by the benchmark.
+    // Cleanup is deliberately abandoned while the device may still own memory.
+    if !matches!(error, LevelZeroError::SubmissionStateUnknown { .. }) {
+        eprintln!("xfer: {error}");
     }
 }
 
@@ -1360,6 +1586,7 @@ mod tests {
         let context = Context {
             handle: ptr::null_mut(),
             driver: 1_usize as raw::ze_driver_handle_t,
+            state: Rc::new(ContextState::default()),
             _driver: PhantomData,
         };
         let matching = Device {
@@ -1380,5 +1607,68 @@ mod tests {
             context.ensure_device(&mismatched),
             Err(LevelZeroError::DeviceDriverMismatch)
         );
+    }
+
+    #[test]
+    fn context_state_requires_successful_synchronization_before_release() {
+        let state = ContextState::default();
+        assert!(state.release_is_safe());
+
+        state.mark_submitted(false);
+        assert!(!state.release_is_safe());
+
+        state.mark_synchronized(true);
+        assert!(state.release_is_safe());
+
+        state.poison();
+        assert!(!state.release_is_safe());
+    }
+
+    #[test]
+    fn queue_rejects_command_list_from_another_context_before_ffi() {
+        let queue_state = Rc::new(ContextState::default());
+        let list_state = Rc::new(ContextState::default());
+        let queue = CommandQueue {
+            handle: ptr::null_mut(),
+            context: 1_usize as raw::ze_context_handle_t,
+            device: 3_usize as raw::ze_device_handle_t,
+            queue_group_ordinal: 2,
+            pending: Cell::new(false),
+            context_state: queue_state,
+            _context: PhantomData,
+        };
+        let list = CommandList {
+            handle: ptr::null_mut(),
+            context: 2_usize as raw::ze_context_handle_t,
+            device: 3_usize as raw::ze_device_handle_t,
+            queue_group_ordinal: 2,
+            context_state: list_state,
+            _context: PhantomData,
+        };
+
+        assert!(matches!(
+            queue.execute(&[&list]),
+            Err(LevelZeroError::IncompatibleObjects { .. })
+        ));
+    }
+
+    #[test]
+    fn unsafe_cleanup_state_abandons_allocation_without_retry() {
+        let state = Rc::new(ContextState::default());
+        state.poison();
+        let mut allocation = HostAllocation {
+            context: ptr::null_mut(),
+            ptr: Some(NonNull::<u8>::dangling().cast()),
+            len: 1,
+            context_state: state,
+            _context: PhantomData,
+        };
+
+        assert!(matches!(
+            allocation.free_inner(),
+            Err(LevelZeroError::SubmissionStateUnknown { .. })
+        ));
+        assert!(allocation.ptr.is_none());
+        assert_eq!(allocation.free_inner(), Ok(()));
     }
 }
