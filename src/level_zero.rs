@@ -42,6 +42,7 @@ pub enum LevelZeroError {
         dst_len: usize,
         src_len: usize,
     },
+    DeviceDriverMismatch,
 }
 
 impl fmt::Display for LevelZeroError {
@@ -62,6 +63,9 @@ impl fmt::Display for LevelZeroError {
                 f,
                 "copy requested {requested} bytes but destination has {dst_len} and source has {src_len}"
             ),
+            Self::DeviceDriverMismatch => {
+                f.write_str("Level Zero device does not belong to the context's driver")
+            }
         }
     }
 }
@@ -437,8 +441,12 @@ impl<'driver> Context<'driver> {
         self.handle
     }
 
-    fn ensure_device(&self, device: &Device) {
-        debug_assert_eq!(self.driver, device.driver);
+    fn ensure_device(&self, device: &Device) -> Result<()> {
+        if self.driver == device.driver {
+            Ok(())
+        } else {
+            Err(LevelZeroError::DeviceDriverMismatch)
+        }
     }
 
     fn destroy(&mut self) -> Result<()> {
@@ -450,15 +458,16 @@ impl<'driver> Context<'driver> {
             // SAFETY: self.handle is an owned context handle that has not yet been destroyed.
             raw::zeContextDestroy(self.handle)
         };
+        check("zeContextDestroy", result)?;
         self.handle = ptr::null_mut();
-        check("zeContextDestroy", result)
+        Ok(())
     }
 }
 
 impl Drop for Context<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy() {
-            eprintln!("xefer: {error}");
+            eprintln!("xfer: {error}");
         }
     }
 }
@@ -475,7 +484,7 @@ impl<'context> CommandQueue<'context> {
         device: &Device,
         queue_group_ordinal: u32,
     ) -> Result<Self> {
-        context.ensure_device(device);
+        context.ensure_device(device)?;
         let desc = raw::ze_command_queue_desc_t {
             stype: raw::ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC,
             pNext: ptr::null(),
@@ -539,15 +548,16 @@ impl<'context> CommandQueue<'context> {
             // SAFETY: self.handle is an owned command queue handle that has not yet been destroyed.
             raw::zeCommandQueueDestroy(self.handle)
         };
+        check("zeCommandQueueDestroy", result)?;
         self.handle = ptr::null_mut();
-        check("zeCommandQueueDestroy", result)
+        Ok(())
     }
 }
 
 impl Drop for CommandQueue<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy() {
-            eprintln!("xefer: {error}");
+            eprintln!("xfer: {error}");
         }
     }
 }
@@ -564,7 +574,7 @@ impl<'context> CommandList<'context> {
         device: &Device,
         queue_group_ordinal: u32,
     ) -> Result<Self> {
-        context.ensure_device(device);
+        context.ensure_device(device)?;
         let desc = raw::ze_command_list_desc_t {
             stype: raw::ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC,
             pNext: ptr::null(),
@@ -752,15 +762,16 @@ impl<'context> CommandList<'context> {
             // SAFETY: self.handle is an owned command list handle that has not yet been destroyed.
             raw::zeCommandListDestroy(self.handle)
         };
+        check("zeCommandListDestroy", result)?;
         self.handle = ptr::null_mut();
-        check("zeCommandListDestroy", result)
+        Ok(())
     }
 }
 
 impl Drop for CommandList<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy_inner() {
-            eprintln!("xefer: {error}");
+            eprintln!("xfer: {error}");
         }
     }
 }
@@ -835,7 +846,7 @@ impl<'context> HostAllocation<'context> {
     }
 
     fn free_inner(&mut self) -> Result<()> {
-        let Some(ptr) = self.ptr.take() else {
+        let Some(ptr) = self.ptr else {
             return Ok(());
         };
 
@@ -843,14 +854,16 @@ impl<'context> HostAllocation<'context> {
             // SAFETY: ptr is an owned allocation from self.context that has not yet been freed.
             raw::zeMemFree(self.context, ptr.as_ptr())
         };
-        check("zeMemFree(host)", result)
+        check("zeMemFree(host)", result)?;
+        self.ptr = None;
+        Ok(())
     }
 }
 
 impl Drop for HostAllocation<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.free_inner() {
-            eprintln!("xefer: {error}");
+            eprintln!("xfer: {error}");
         }
     }
 }
@@ -871,7 +884,7 @@ impl<'context> DeviceAllocation<'context> {
         alignment: usize,
         memory_ordinal: u32,
     ) -> Result<Self> {
-        context.ensure_device(device);
+        context.ensure_device(device)?;
         let desc = raw::ze_device_mem_alloc_desc_t {
             stype: raw::ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC,
             pNext: ptr::null(),
@@ -924,7 +937,7 @@ impl<'context> DeviceAllocation<'context> {
     }
 
     fn free_inner(&mut self) -> Result<()> {
-        let Some(ptr) = self.ptr.take() else {
+        let Some(ptr) = self.ptr else {
             return Ok(());
         };
 
@@ -932,14 +945,16 @@ impl<'context> DeviceAllocation<'context> {
             // SAFETY: ptr is an owned allocation from self.context that has not yet been freed.
             raw::zeMemFree(self.context, ptr.as_ptr())
         };
-        check("zeMemFree(device)", result)
+        check("zeMemFree(device)", result)?;
+        self.ptr = None;
+        Ok(())
     }
 }
 
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.free_inner() {
-            eprintln!("xefer: {error}");
+            eprintln!("xfer: {error}");
         }
     }
 }
@@ -962,10 +977,10 @@ impl<'context> EventPool<'context> {
         let mut device_handles = devices
             .iter()
             .map(|device| {
-                context.ensure_device(device);
-                device.handle()
+                context.ensure_device(device)?;
+                Ok(device.handle())
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let devices_ptr = if device_handles.is_empty() {
             ptr::null_mut()
         } else {
@@ -1061,15 +1076,16 @@ impl<'context> EventPool<'context> {
             // SAFETY: self.handle is an owned event pool handle that has not yet been destroyed.
             raw::zeEventPoolDestroy(self.handle)
         };
+        check("zeEventPoolDestroy", result)?;
         self.handle = ptr::null_mut();
-        check("zeEventPoolDestroy", result)
+        Ok(())
     }
 }
 
 impl Drop for EventPool<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy_inner() {
-            eprintln!("xefer: {error}");
+            eprintln!("xfer: {error}");
         }
     }
 }
@@ -1130,15 +1146,16 @@ impl Event<'_> {
             // SAFETY: self.handle is an owned event handle that has not yet been destroyed.
             raw::zeEventDestroy(self.handle)
         };
+        check("zeEventDestroy", result)?;
         self.handle = ptr::null_mut();
-        check("zeEventDestroy", result)
+        Ok(())
     }
 }
 
 impl Drop for Event<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.destroy_inner() {
-            eprintln!("xefer: {error}");
+            eprintln!("xfer: {error}");
         }
     }
 }
@@ -1335,6 +1352,33 @@ mod tests {
                 operation: "unit",
                 count: usize::MAX,
             }
+        );
+    }
+
+    #[test]
+    fn context_rejects_device_from_another_driver() {
+        let context = Context {
+            handle: ptr::null_mut(),
+            driver: 1_usize as raw::ze_driver_handle_t,
+            _driver: PhantomData,
+        };
+        let matching = Device {
+            driver: 1_usize as raw::ze_driver_handle_t,
+            handle: ptr::null_mut(),
+            driver_index: 0,
+            index: 0,
+        };
+        let mismatched = Device {
+            driver: 2_usize as raw::ze_driver_handle_t,
+            handle: ptr::null_mut(),
+            driver_index: 1,
+            index: 0,
+        };
+
+        assert_eq!(context.ensure_device(&matching), Ok(()));
+        assert_eq!(
+            context.ensure_device(&mismatched),
+            Err(LevelZeroError::DeviceDriverMismatch)
         );
     }
 }

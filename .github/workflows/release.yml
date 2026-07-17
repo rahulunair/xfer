@@ -27,22 +27,22 @@ jobs:
       - run: cargo build --locked --release
       - name: Verify runtime dependencies
         run: |
-          readelf -d target/release/xefer | grep NEEDED
-          test "$(readelf -d target/release/xefer | grep NEEDED | grep -Ev 'libze_loader\\.so\\.1|libgcc_s\\.so\\.1|libc\\.so\\.6|ld-linux' | wc -l)" -eq 0
+          readelf -d target/release/xfer | grep NEEDED
+          test "$(readelf -d target/release/xfer | grep NEEDED | grep -Ev 'libze_loader\\.so\\.1|libgcc_s\\.so\\.1|libc\\.so\\.6|ld-linux' | wc -l)" -eq 0
       - name: Package portable binary
         run: |
-          install -Dm755 target/release/xefer dist/xefer
-          tar -C dist -czf xefer-x86_64-linux-gnu.tar.gz xefer
-          sha256sum xefer-x86_64-linux-gnu.tar.gz > xefer-x86_64-linux-gnu.tar.gz.sha256
+          install -Dm755 target/release/xfer dist/xfer
+          tar -C dist -czf xfer-x86_64-linux-gnu.tar.gz xfer
+          sha256sum xfer-x86_64-linux-gnu.tar.gz > xfer-x86_64-linux-gnu.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
-          name: xefer-x86_64-linux-gnu
+          name: xfer-x86_64-linux-gnu
           path: |
-            xefer-x86_64-linux-gnu.tar.gz
-            xefer-x86_64-linux-gnu.tar.gz.sha256
+            xfer-x86_64-linux-gnu.tar.gz
+            xfer-x86_64-linux-gnu.tar.gz.sha256
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            xefer-x86_64-linux-gnu.tar.gz
-            xefer-x86_64-linux-gnu.tar.gz.sha256
+            xfer-x86_64-linux-gnu.tar.gz
+            xfer-x86_64-linux-gnu.tar.gz.sha256

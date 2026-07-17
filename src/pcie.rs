@@ -546,10 +546,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before Unix epoch")
                 .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "xferbench-pcie-test-{}-{nonce}",
-                std::process::id()
-            ));
+            let root =
+                std::env::temp_dir().join(format!("xfer-pcie-test-{}-{nonce}", std::process::id()));
             fs::create_dir_all(root.join(SYSFS_PCI_DEVICES)).expect("create fake sysfs");
             Self { root }
         }

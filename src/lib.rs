@@ -14,6 +14,7 @@
 )]
 
 pub mod benchmark;
+mod bootstrap;
 pub mod cli;
 pub mod histogram;
 pub mod level_zero;

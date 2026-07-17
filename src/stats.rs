@@ -35,12 +35,24 @@ pub struct TukeyOutliers {
 pub struct Summary {
     pub count: usize,
     pub median: f64,
+    pub median_confidence: ConfidenceInterval,
     pub mad: f64,
     pub p5: f64,
     pub p95: f64,
     pub quartiles: Quartiles,
     pub outliers: TukeyOutliers,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConfidenceInterval {
+    pub confidence_level: f64,
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+    pub resamples: usize,
+}
+
+pub const CONFIDENCE_LEVEL: f64 = 0.95;
+pub const BOOTSTRAP_RESAMPLES: usize = 10_000;
 
 pub fn median(samples: &[f64]) -> Option<f64> {
     percentile(samples, 50.0)
@@ -101,9 +113,22 @@ pub fn tukey_outliers(samples: &[f64]) -> Option<TukeyOutliers> {
 }
 
 pub fn summarize(samples: &[f64]) -> Option<Summary> {
+    let median = median(samples)?;
+    let (lower_bound, upper_bound) = crate::bootstrap::median_confidence_interval(
+        samples,
+        CONFIDENCE_LEVEL,
+        BOOTSTRAP_RESAMPLES,
+    )?;
+
     Some(Summary {
         count: samples.len(),
-        median: median(samples)?,
+        median,
+        median_confidence: ConfidenceInterval {
+            confidence_level: CONFIDENCE_LEVEL,
+            lower_bound,
+            upper_bound,
+            resamples: BOOTSTRAP_RESAMPLES,
+        },
         mad: mad(samples)?,
         p5: percentile(samples, 5.0)?,
         p95: percentile(samples, 95.0)?,
@@ -275,6 +300,10 @@ mod tests {
 
         assert_eq!(summary.count, 5);
         assert_close(summary.median, 30.0);
+        assert_eq!(summary.median_confidence.confidence_level, 0.95);
+        assert!(summary.median_confidence.lower_bound <= summary.median);
+        assert!(summary.median_confidence.upper_bound >= summary.median);
+        assert_eq!(summary.median_confidence.resamples, BOOTSTRAP_RESAMPLES);
         assert_close(summary.mad, 10.0);
         assert_close(summary.p5, 12.0);
         assert_close(summary.p95, 48.0);

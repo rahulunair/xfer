@@ -1,11 +1,11 @@
-//! Hand-written command-line parsing for xefer.
+//! Hand-written command-line parsing for xfer.
 //!
 //! The parser keeps all defaults and help/version text embedded in the binary.
 
 use std::fmt;
 use std::time::Duration;
 
-pub const PROGRAM_NAME: &str = "xefer";
+pub const PROGRAM_NAME: &str = "xfer";
 pub const VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(version) => version,
     None => "0.0.0-dev",
@@ -253,7 +253,7 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
                 let value = take_option_value(args, &mut index, name, value)?;
                 options.transfer_class = Some(parse_transfer_class(&value)?);
             }
-            "--queue" | "--queue-ordinal" => {
+            "--engine" | "--queue" | "--queue-ordinal" => {
                 let value = take_option_value(args, &mut index, name, value)?;
                 options.queue_ordinal = Some(parse_u32(&value, name)?);
             }
@@ -514,16 +514,16 @@ fn normalize_value(value: &str) -> String {
 }
 
 const GENERAL_HELP: &str = "\
-xefer - measure Intel Level Zero transfer performance
+xfer - measure Intel Level Zero transfer performance
 
 Usage:
-  xefer list
-  xefer bench [OPTIONS]
-  xefer --help
-  xefer --version
+  xfer list
+  xfer bench [OPTIONS]
+  xfer --help
+  xfer --version
 
 Commands:
-  list    Print Level Zero GPUs, queue groups, peer access, and PCIe links
+  list    Print Level Zero GPUs, engines, peer access, and PCIe links
   bench   Measure a useful transfer matrix, or a filtered subset
 
 Options:
@@ -533,10 +533,10 @@ Options:
 
 const LIST_HELP: &str = "\
 Usage:
-  xefer list
+  xfer list
 
-Print Level Zero GPUs, queue-group ordinals and flags, peer-access matrix,
-and negotiated PCIe link information.
+Print Level Zero GPUs, copy engines, peer-access matrix, and negotiated PCIe
+link information.
 
 Options:
   -h, --help       Print help
@@ -545,19 +545,19 @@ Options:
 
 const BENCH_HELP: &str = "\
 Usage:
-  xefer bench [OPTIONS]
+  xfer bench [OPTIONS]
 
-With no options, xefer bench automatically runs a useful matrix for the
-available Level Zero GPUs and queue groups. Filters narrow that matrix; they do
-not silently select fallback devices, queues, timing modes, or transfer paths.
+With no options, xfer bench automatically runs a useful matrix for the
+available Level Zero GPUs and engines. Filters narrow that matrix; they do not
+silently select fallback devices, engines, timing modes, or transfer paths.
 
 Options:
       --device N                  Select source/local device index
       --peer-device N             Select peer device index for cross-device cases
       --class CLASS               h2d, d2h, d2d-same-device, d2d-direct, d2d-staged
       --transfer-class CLASS      Alias for --class
-      --queue ORDINAL             Select Level Zero queue-group ordinal
-      --queue-ordinal ORDINAL     Alias for --queue
+      --engine ID                 Select the engine shown by 'xfer list'
+      --queue ID                  Alias for --engine
       --size BYTES                Allocation size, e.g. 268435456, 256MiB, 1GB
       --samples N                 Sample count; default 50
       --warmup DURATION           Warm-up duration, e.g. 500ms, 1s; default 1s
@@ -618,7 +618,7 @@ mod tests {
             "--peer-device=1",
             "--class",
             "d2d-direct",
-            "--queue-ordinal",
+            "--engine",
             "2",
             "--size",
             "256MiB",
@@ -689,9 +689,9 @@ mod tests {
 
     #[test]
     fn embedded_help_mentions_required_commands_and_flags() {
-        assert!(help(HelpTopic::General).contains("xefer list"));
+        assert!(help(HelpTopic::General).contains("xfer list"));
         assert!(help(HelpTopic::Bench).contains("--device-timestamps"));
         assert!(help(HelpTopic::Bench).contains("--format FORMAT"));
-        assert!(version().starts_with("xefer "));
+        assert!(version().starts_with("xfer "));
     }
 }

@@ -97,24 +97,26 @@ impl Histogram {
         }
 
         let max_count = self.bins.iter().map(|bin| bin.count).max().unwrap_or(0);
-        let label_width = self
+        let label_decimals = label_decimals(&self.bins);
+        let labels = self
             .bins
             .iter()
-            .map(|bin| format_label(bin.lower).len())
-            .max()
-            .unwrap_or(0);
+            .map(|bin| format_label(bin.lower, label_decimals))
+            .collect::<Vec<_>>();
+        let label_width = labels.iter().map(String::len).max().unwrap_or(0);
 
         Some(
             self.bins
                 .iter()
-                .map(|bin| {
+                .zip(labels)
+                .map(|(bin, label)| {
                     let bar_len = scaled_bar_len(bin.count, max_count, max_bar_width);
                     let marks_median = median
                         .filter(|value| value.is_finite())
                         .is_some_and(|value| bin_contains(value, bin, self.upper));
 
                     HistogramRow {
-                        label: format!("{:>label_width$}", format_label(bin.lower)),
+                        label: format!("{label:>label_width$}"),
                         bar: "#".repeat(bar_len),
                         count: bin.count,
                         marks_median,
@@ -160,10 +162,36 @@ fn bin_contains(value: f64, bin: &HistogramBin, histogram_upper: f64) -> bool {
     bin.lower <= value && (value < bin.upper || (value == histogram_upper && value == bin.upper))
 }
 
-fn format_label(value: f64) -> String {
-    let rounded = format!("{value:.1}");
-    if rounded == "-0.0" {
-        "0.0".to_owned()
+fn label_decimals(bins: &[HistogramBin]) -> usize {
+    if bins.len() <= 1 {
+        return 1;
+    }
+
+    for decimals in 1..=6 {
+        let mut labels = bins.iter().map(|bin| format_label(bin.lower, decimals));
+        let Some(mut previous) = labels.next() else {
+            return 1;
+        };
+        let mut distinct = true;
+        for label in labels {
+            if label == previous {
+                distinct = false;
+                break;
+            }
+            previous = label;
+        }
+        if distinct {
+            return decimals;
+        }
+    }
+
+    9
+}
+
+fn format_label(value: f64, decimals: usize) -> String {
+    let rounded = format!("{value:.decimals$}");
+    if rounded.starts_with('-') && rounded.parse::<f64>() == Ok(0.0) {
+        rounded[1..].to_owned()
     } else {
         rounded
     }
@@ -328,6 +356,16 @@ mod tests {
             lines,
             vec![" 9.0 | ##".to_owned(), "10.0 | ######  median".to_owned()]
         );
+    }
+
+    #[test]
+    fn narrow_histogram_uses_distinct_adaptive_labels() {
+        let histogram = Histogram::from_samples(&[13.801, 13.804, 13.807, 13.810], 3).unwrap();
+        let rows = histogram.rows(6, None).unwrap();
+
+        assert_eq!(rows[0].label, "13.801");
+        assert_eq!(rows[1].label, "13.804");
+        assert_eq!(rows[2].label, "13.807");
     }
 
     #[test]

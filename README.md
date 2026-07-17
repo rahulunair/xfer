@@ -1,6 +1,6 @@
-# xefer
+# xfer
 
-`xefer` is a small Unix-style CLI for measuring host/device and
+`xfer` is a small Unix-style CLI for measuring host/device and
 device/device transfer performance on Intel GPUs through the Level Zero API.
 It reports application-observed wall-clock time by default and can use Level
 Zero device timestamps when the selected device supports them.
@@ -8,21 +8,32 @@ Zero device timestamps when the selected device supports them.
 The normal workflow needs no hardware-specific arguments:
 
 ```sh
-xefer bench
+xfer bench
 ```
 
-`xefer` discovers the GPUs and usable copy paths, verifies every copy, and
+`xfer` discovers the GPUs and usable copy paths, verifies every copy, and
 prints measured bandwidth beside the negotiated PCIe payload ceiling. This is
 a low-level transfer baseline for diagnosing slower CCL or model workloads; it
 does not claim to measure those higher-level runtimes.
 
 ## Requirements
 
+To run a prebuilt `xfer` binary:
+
+- 64-bit x86 Linux with glibc compatible with the release artifact
+- The Level Zero loader (`libze_loader.so.1`) and Intel GPU driver
+- Permission to access the Intel GPU devices
+
+The binary has no configuration files, daemon, language runtime, or bundled
+GPU libraries. Copy the single executable to another machine whose Intel
+Level Zero runtime is already working.
+
+To build `xfer`:
+
 - Rust 1.85 or newer
 - Clang and libclang (used by `bindgen`)
 - Level Zero headers providing `level_zero/ze_api.h`
 - The Level Zero loader library (`libze_loader.so`)
-- An Intel GPU with a working Level Zero driver for hardware measurements
 
 On Arch Linux, the development prerequisites are provided by packages such as
 `rust`, `clang`, and `level-zero-loader`. Package names differ by distribution.
@@ -45,32 +56,32 @@ LEVEL_ZERO_INCLUDE=/opt/level-zero/include cargo build --release
 
 ## Usage
 
-List GPUs, queue groups, peer-access capability, and negotiated PCIe links:
+List GPUs, copy engines, peer-access capability, and negotiated PCIe links:
 
 ```sh
-xefer list
+xfer list
 ```
 
 Run the default useful transfer matrix:
 
 ```sh
-xefer bench
+xfer bench
 ```
 
-Select a transfer and queue explicitly:
+Select a transfer and engine explicitly:
 
 ```sh
-xefer bench --device 0 --class h2d --queue 1 --size 256MiB --samples 50
+xfer bench --device 0 --class h2d --engine 1 --size 256MiB --samples 50
 ```
 
 Produce stable machine-readable output:
 
 ```sh
-xefer bench --format csv --no-histogram
+xfer bench --format csv --no-histogram
 ```
 
-Device, queue, transfer-class, size, and sample controls are advanced
-overrides. Use `xefer --help` or `xefer bench --help` for the complete
+Device, engine, transfer-class, size, and sample controls are advanced
+overrides. Use `xfer --help` or `xfer bench --help` for the complete
 interface.
 
 ## Timing and interpretation
@@ -78,6 +89,19 @@ interface.
 Wall-clock samples cover command submission through queue synchronization.
 Device-timestamp samples are clearly labeled and are never combined with
 wall-clock samples.
+
+Each case uses a flat sample design: one sample is one independently timed and
+verified transfer. Warm-up uses the same command path, while allocation,
+initialization, destination clearing, and byte verification stay outside the
+measured interval. Increasing iteration counts and fitting a time-per-iteration
+regression would hide transfer-to-transfer variation, so `xfer` does not use
+that CPU microbenchmark technique.
+
+The main interval is a deterministic 95% percentile-bootstrap confidence
+interval for the median, using 10,000 resamples with replacement. The report
+also retains the sample p5/p95 spread, unscaled median absolute deviation, and
+modified Tukey fences at 1.5 and 3 interquartile ranges. Outliers are reported
+but never discarded.
 
 Cross-device `direct` means one Level Zero memory-copy command between
 allocations owned by different devices. The separately reported
