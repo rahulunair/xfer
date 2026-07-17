@@ -13,14 +13,12 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
       - name: Install Level Zero development files
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libze-dev libclang-dev pkg-config
+        run: .github/scripts/install-level-zero.sh
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
