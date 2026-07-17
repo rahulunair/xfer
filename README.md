@@ -98,10 +98,12 @@ regression would hide transfer-to-transfer variation, so `xfer` does not use
 that CPU microbenchmark technique.
 
 The main interval is a deterministic 95% percentile-bootstrap confidence
-interval for the median, using 10,000 resamples with replacement. The report
-also retains the sample p5/p95 spread, unscaled median absolute deviation, and
-modified Tukey fences at 1.5 and 3 interquartile ranges. Outliers are reported
-but never discarded.
+interval for the median measured duration, using 10,000 resamples with
+replacement. Bandwidth estimates and interval bounds are derived by inverting
+those duration estimates. The report also retains the bandwidth sample p5/p95
+spread and unscaled median absolute deviation. Modified Tukey fences at 1.5
+and 3 interquartile ranges classify measured durations; outliers are reported
+but never discarded. At least 10 samples are required.
 
 Cross-device `direct` means one Level Zero memory-copy command between
 allocations owned by different devices. The separately reported

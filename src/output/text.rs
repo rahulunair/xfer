@@ -167,25 +167,19 @@ fn render_case_lines(case: &BenchCase, options: &TextOptions) -> Vec<String> {
 
     match &case.outcome {
         CaseOutcome::Measured {
+            time_summary,
             summary,
             samples_gb_s,
         } => {
-            let time_interval = [
-                seconds_for_rate(case.byte_count, summary.median_confidence.upper_bound),
-                seconds_for_rate(case.byte_count, summary.median),
-                seconds_for_rate(case.byte_count, summary.median_confidence.lower_bound),
-            ]
-            .into_iter()
-            .collect::<Option<Vec<_>>>();
             lines.push(String::new());
-            if let Some(time) = time_interval {
-                let [lower, estimate, upper] = format_seconds_triplet([time[0], time[1], time[2]]);
-                lines.push(format!(
-                    "  time        [ {lower:>12}  {estimate:>12}  {upper:>12} ]"
-                ));
-            } else {
-                lines.push("  time        [      unknown       unknown       unknown ]".to_owned());
-            }
+            let [lower, estimate, upper] = format_seconds_triplet([
+                time_summary.median_confidence.lower_bound,
+                time_summary.median,
+                time_summary.median_confidence.upper_bound,
+            ]);
+            lines.push(format!(
+                "  time        [ {lower:>12}  {estimate:>12}  {upper:>12} ]"
+            ));
             let [lower, estimate, upper] = format_rate_triplet([
                 summary.median_confidence.lower_bound,
                 summary.median,
@@ -216,10 +210,10 @@ fn render_case_lines(case: &BenchCase, options: &TextOptions) -> Vec<String> {
             }
             lines.push(format!(
                 "  outliers     {}/{} ({} mild, {} severe)",
-                summary.outliers.counts.mild + summary.outliers.counts.severe,
-                summary.count,
-                summary.outliers.counts.mild,
-                summary.outliers.counts.severe
+                time_summary.outliers.counts.mild + time_summary.outliers.counts.severe,
+                time_summary.count,
+                time_summary.outliers.counts.mild,
+                time_summary.outliers.counts.severe
             ));
 
             if options.include_histogram {
@@ -239,14 +233,6 @@ fn render_case_lines(case: &BenchCase, options: &TextOptions) -> Vec<String> {
     }
 
     lines
-}
-
-fn seconds_for_rate(byte_count: u64, gb_s: f64) -> Option<f64> {
-    if !gb_s.is_finite() || gb_s <= 0.0 {
-        return None;
-    }
-
-    Some(byte_count as f64 / (gb_s * 1_000_000_000.0))
 }
 
 fn case_label(case: &BenchCase) -> String {
@@ -461,6 +447,7 @@ mod tests {
                 theoretical_gb_s: 63.015_384,
             },
             outcome: CaseOutcome::Measured {
+                time_summary: Box::new(summary),
                 summary,
                 samples_gb_s: samples,
             },
@@ -492,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn derives_time_confidence_interval_from_inverse_throughput() {
+    fn displays_time_confidence_interval_from_duration_statistics() {
         let case = measured_case_with_samples(vec![10.0, 20.0, 40.0]);
         let text = render_case_text(
             &case,
@@ -503,7 +490,7 @@ mod tests {
         );
 
         assert!(text.contains("time        ["));
-        assert!(text.contains("13.42 ms"));
+        assert!(text.contains("20 s"));
         assert!(text.contains("throughput  ["));
         assert!(text.contains("20 GB/s"));
         assert!(text.contains("95% bootstrap confidence interval (10000 resamples)"));

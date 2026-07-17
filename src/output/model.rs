@@ -134,6 +134,7 @@ pub enum AllocationKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CaseOutcome {
     Measured {
+        time_summary: Box<Summary>,
         summary: Summary,
         samples_gb_s: Vec<f64>,
     },

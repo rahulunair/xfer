@@ -15,9 +15,13 @@ pub fn render_bench_csv(report: &BenchReport) -> String {
 
 pub fn render_case_csv(case: &BenchCase) -> String {
     let mut fields = Vec::new();
-    let (status, summary, skip_reason) = match &case.outcome {
-        CaseOutcome::Measured { summary, .. } => ("measured", Some(summary), ""),
-        CaseOutcome::Skipped { reason } => ("skipped", None, reason.as_str()),
+    let (status, summary, time_summary, skip_reason) = match &case.outcome {
+        CaseOutcome::Measured {
+            summary,
+            time_summary,
+            ..
+        } => ("measured", Some(summary), Some(time_summary), ""),
+        CaseOutcome::Skipped { reason } => ("skipped", None, None, reason.as_str()),
     };
 
     fields.push(status.to_owned());
@@ -47,8 +51,9 @@ pub fn render_case_csv(case: &BenchCase) -> String {
         fields.push(format_float(summary.mad));
         fields.push(format_float(summary.p5));
         fields.push(format_float(summary.p95));
-        fields.push(summary.outliers.counts.mild.to_string());
-        fields.push(summary.outliers.counts.severe.to_string());
+        let time_summary = time_summary.expect("measured cases have duration statistics");
+        fields.push(time_summary.outliers.counts.mild.to_string());
+        fields.push(time_summary.outliers.counts.severe.to_string());
     } else {
         for _ in 0..10 {
             fields.push(String::new());
@@ -170,6 +175,7 @@ mod tests {
                 theoretical_gb_s: 63.015_384,
             },
             outcome: CaseOutcome::Measured {
+                time_summary: Box::new(summary),
                 summary,
                 samples_gb_s: samples,
             },

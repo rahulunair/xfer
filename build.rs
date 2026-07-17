@@ -5,6 +5,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=LEVEL_ZERO_INCLUDE");
+    println!("cargo:rerun-if-env-changed=LEVEL_ZERO_LIB");
 
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
@@ -28,6 +29,22 @@ fn main() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for flag in stdout.split_whitespace() {
                 builder = builder.clang_arg(flag);
+            }
+        }
+    }
+
+    if let Ok(lib_dir) = env::var("LEVEL_ZERO_LIB") {
+        println!("cargo:rustc-link-search=native={lib_dir}");
+    } else if let Ok(output) = Command::new("pkg-config")
+        .args(["--libs-only-L", "level-zero"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for flag in stdout.split_whitespace() {
+                if let Some(path) = flag.strip_prefix("-L") {
+                    println!("cargo:rustc-link-search=native={path}");
+                }
             }
         }
     }

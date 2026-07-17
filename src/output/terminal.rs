@@ -244,6 +244,7 @@ mod tests {
                 reason: "test".to_owned(),
             },
             outcome: CaseOutcome::Measured {
+                time_summary: Box::new(summary),
                 summary,
                 samples_gb_s: samples,
             },

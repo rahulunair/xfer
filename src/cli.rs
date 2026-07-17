@@ -13,6 +13,7 @@ pub const VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
 
 pub const DEFAULT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_SAMPLES: u32 = 50;
+pub const MIN_SAMPLES: u32 = 10;
 pub const DEFAULT_WARMUP: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -263,7 +264,7 @@ fn parse_bench(args: &[String]) -> Result<CliAction, CliError> {
             }
             "--samples" => {
                 let value = take_option_value(args, &mut index, name, value)?;
-                options.samples = parse_nonzero_u32(&value, name)?;
+                options.samples = parse_sample_count(&value, name)?;
             }
             "--warmup" => {
                 let value = take_option_value(args, &mut index, name, value)?;
@@ -398,11 +399,11 @@ fn parse_u32(value: &str, option: &str) -> Result<u32, CliError> {
         .map_err(|_| CliError::new(format!("option '{option}' expects an unsigned integer")))
 }
 
-fn parse_nonzero_u32(value: &str, option: &str) -> Result<u32, CliError> {
+fn parse_sample_count(value: &str, option: &str) -> Result<u32, CliError> {
     let parsed = parse_u32(value, option)?;
-    if parsed == 0 {
+    if parsed < MIN_SAMPLES {
         Err(CliError::new(format!(
-            "option '{option}' must be greater than zero"
+            "option '{option}' must be at least {MIN_SAMPLES}"
         )))
     } else {
         Ok(parsed)
@@ -559,7 +560,7 @@ Options:
       --engine ID                 Select the engine shown by 'xfer list'
       --queue ID                  Alias for --engine
       --size BYTES                Allocation size, e.g. 268435456, 256MiB, 1GB
-      --samples N                 Sample count; default 50
+      --samples N                 Sample count, minimum 10; default 50
       --warmup DURATION           Warm-up duration, e.g. 500ms, 1s; default 1s
       --timing MODE               wall-clock or device-timestamps
       --device-timestamps         Alias for --timing device-timestamps
@@ -682,7 +683,8 @@ mod tests {
     fn rejects_bad_values_without_fallback() {
         assert!(parse_err(&["run"]).contains("unknown command"));
         assert!(parse_err(&["bench", "--format", "json"]).contains("invalid format"));
-        assert!(parse_err(&["bench", "--samples", "0"]).contains("greater than zero"));
+        assert!(parse_err(&["bench", "--samples", "0"]).contains("at least 10"));
+        assert!(parse_err(&["bench", "--samples", "9"]).contains("at least 10"));
         assert!(parse_err(&["bench", "--size", "4XB"]).contains("invalid size unit"));
         assert!(parse_err(&["bench", "--unknown"]).contains("unknown option"));
     }

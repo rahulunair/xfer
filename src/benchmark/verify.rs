@@ -11,20 +11,23 @@ pub(crate) struct VerificationMismatch {
 }
 
 pub(crate) fn fill_pattern(buffer: &mut [u8], seed: u8) {
-    for (index, byte) in buffer.iter_mut().enumerate() {
-        *byte = expected_byte(index, seed);
+    for (word_index, chunk) in buffer.chunks_mut(8).enumerate() {
+        let expected = pattern_word(word_index, seed).to_le_bytes();
+        chunk.copy_from_slice(&expected[..chunk.len()]);
     }
 }
 
 fn verify_pattern(buffer: &[u8], seed: u8) -> std::result::Result<(), VerificationMismatch> {
-    for (index, actual) in buffer.iter().copied().enumerate() {
-        let expected = expected_byte(index, seed);
-        if actual != expected {
-            return Err(VerificationMismatch {
-                offset: index,
-                expected,
-                actual,
-            });
+    for (word_index, chunk) in buffer.chunks(8).enumerate() {
+        let expected = pattern_word(word_index, seed).to_le_bytes();
+        for (byte_index, actual) in chunk.iter().copied().enumerate() {
+            if actual != expected[byte_index] {
+                return Err(VerificationMismatch {
+                    offset: word_index * 8 + byte_index,
+                    expected: expected[byte_index],
+                    actual,
+                });
+            }
         }
     }
     Ok(())
@@ -45,10 +48,16 @@ pub(crate) fn verify_or_fail(
     })
 }
 
+#[cfg(test)]
 fn expected_byte(index: usize, seed: u8) -> u8 {
-    let low = index.to_le_bytes()[0];
-    let mixed = low.wrapping_mul(31).rotate_left(3);
-    seed ^ mixed.wrapping_add(0x3d)
+    pattern_word(index / 8, seed).to_le_bytes()[index % 8]
+}
+
+fn pattern_word(word_index: usize, seed: u8) -> u64 {
+    let mut value = (word_index as u64) ^ (u64::from(seed) << 56) ^ 0x5846_4552_5041_5454;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 #[cfg(test)]
@@ -69,5 +78,14 @@ mod tests {
                 actual: expected_byte(17, PATTERN_SEED) ^ 1,
             })
         );
+    }
+
+    #[test]
+    fn pattern_does_not_repeat_at_256_byte_boundaries() {
+        let mut bytes = vec![0; 768];
+        fill_pattern(&mut bytes, PATTERN_SEED);
+
+        assert_ne!(&bytes[..256], &bytes[256..512]);
+        assert_ne!(&bytes[256..512], &bytes[512..]);
     }
 }
