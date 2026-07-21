@@ -73,6 +73,7 @@ fn throughput_summary(bytes: u64, samples_gb_s: &[f64], time: Summary) -> Option
         p95: stats::percentile(samples_gb_s, 95.0)?,
         quartiles: stats::quartiles(samples_gb_s)?,
         outliers: stats::tukey_outliers(samples_gb_s)?,
+        shape: stats::distribution_shape(samples_gb_s)?,
     })
 }
 

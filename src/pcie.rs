@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,10 @@ impl PciAddress {
             "{:04x}:{:02x}:{:02x}.{}",
             self.domain, self.bus, self.device, self.function
         )
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        parse_pci_address_component(text)
     }
 }
 
@@ -106,7 +111,11 @@ pub enum PcieLinkUnknown {
     InvalidAddress,
     MissingDevice(PathBuf),
     UnreliableDevicePath(PathBuf),
-    UnreadableField { path: PathBuf, error: String },
+    UnreadableField {
+        path: PathBuf,
+        kind: std::io::ErrorKind,
+        error: String,
+    },
     UnrecognizedSpeed(String),
     UnrecognizedWidth(String),
 }
@@ -134,6 +143,12 @@ pub enum PciePeerRoute {
         source_host_bridge: String,
         destination_host_bridge: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PciBridgeAncestor {
+    pub address: PciAddress,
+    pub sysfs_path: PathBuf,
 }
 
 pub fn read_link(address: PciAddress) -> PcieLinkStatus {
@@ -211,6 +226,24 @@ pub fn read_peer_route_from_sysfs(
     let destination = resolve_pci_device(sysfs_root.as_ref(), destination)?;
     classify_peer_route(&source, &destination)
         .ok_or_else(|| PcieLinkUnknown::UnreliableDevicePath(source.device_sysfs.clone()))
+}
+
+pub fn pci_bridge_ancestor_union(
+    source: PciAddress,
+    destination: PciAddress,
+) -> Result<Vec<PciBridgeAncestor>, PcieLinkUnknown> {
+    pci_bridge_ancestor_union_from_sysfs(Path::new("/sys"), source, destination)
+}
+
+pub fn pci_bridge_ancestor_union_from_sysfs(
+    sysfs_root: impl AsRef<Path>,
+    source: PciAddress,
+    destination: PciAddress,
+) -> Result<Vec<PciBridgeAncestor>, PcieLinkUnknown> {
+    let source = resolve_pci_device(sysfs_root.as_ref(), source)?;
+    let destination = resolve_pci_device(sysfs_root.as_ref(), destination)?;
+
+    Ok(bridge_ancestor_union(&source, &destination))
 }
 
 pub fn parse_link_speed(text: &str) -> Option<LinkSpeed> {
@@ -302,10 +335,7 @@ fn resolve_pci_device(
             return Err(PcieLinkUnknown::MissingDevice(path));
         }
         Err(error) => {
-            return Err(PcieLinkUnknown::UnreadableField {
-                path,
-                error: error.to_string(),
-            });
+            return Err(unreadable_field(path, &error));
         }
     };
 
@@ -313,17 +343,12 @@ fn resolve_pci_device(
         return Err(PcieLinkUnknown::UnreliableDevicePath(path));
     }
 
-    let Ok(canonical_root) = fs::canonicalize(sysfs_root.as_ref()) else {
-        return Err(PcieLinkUnknown::UnreliableDevicePath(path));
-    };
-
-    let Ok(canonical_path) = fs::canonicalize(&path) else {
-        return Err(PcieLinkUnknown::UnreliableDevicePath(path));
-    };
-
-    let Ok(target_metadata) = fs::metadata(&path) else {
-        return Err(PcieLinkUnknown::UnreliableDevicePath(path));
-    };
+    let canonical_root = fs::canonicalize(sysfs_root.as_ref())
+        .map_err(|error| unreadable_field(sysfs_root.as_ref().to_path_buf(), &error))?;
+    let canonical_path =
+        fs::canonicalize(&path).map_err(|error| unreadable_field(path.clone(), &error))?;
+    let target_metadata =
+        fs::metadata(&path).map_err(|error| unreadable_field(path.clone(), &error))?;
 
     if !target_metadata.is_dir() || !canonical_path.starts_with(canonical_root) {
         return Err(PcieLinkUnknown::UnreliableDevicePath(path));
@@ -343,6 +368,14 @@ fn resolve_pci_device(
         canonical_sysfs: canonical_path,
         canonical_bdfs: canonical_bdf_path,
     })
+}
+
+fn unreadable_field(path: PathBuf, error: &std::io::Error) -> PcieLinkUnknown {
+    PcieLinkUnknown::UnreadableField {
+        path,
+        kind: error.kind(),
+        error: error.to_string(),
+    }
 }
 
 fn negotiated_link_source_path(
@@ -406,6 +439,44 @@ fn classify_peer_route(
     })
 }
 
+fn bridge_ancestor_union(
+    source: &ResolvedPciDevice,
+    destination: &ResolvedPciDevice,
+) -> Vec<PciBridgeAncestor> {
+    let source_endpoint = source.canonical_bdfs.last().map(|(address, _)| *address);
+    let destination_endpoint = destination
+        .canonical_bdfs
+        .last()
+        .map(|(address, _)| *address);
+    let mut ancestors_by_path = BTreeMap::new();
+    for (address, path) in source
+        .canonical_bdfs
+        .iter()
+        .take(source.canonical_bdfs.len().saturating_sub(1))
+        .chain(
+            destination
+                .canonical_bdfs
+                .iter()
+                .take(destination.canonical_bdfs.len().saturating_sub(1)),
+        )
+    {
+        if Some(*address) == source_endpoint || Some(*address) == destination_endpoint {
+            continue;
+        }
+        ancestors_by_path
+            .entry(path.clone())
+            .or_insert_with(|| *address);
+    }
+
+    ancestors_by_path
+        .into_iter()
+        .map(|(sysfs_path, address)| PciBridgeAncestor {
+            address,
+            sysfs_path,
+        })
+        .collect()
+}
+
 fn matching_slot_ancestor_paths(
     sysfs_root: &Path,
     device: &ResolvedPciDevice,
@@ -417,6 +488,7 @@ fn matching_slot_ancestor_paths(
         Err(error) => {
             return Err(PcieLinkUnknown::UnreadableField {
                 path: slots_dir,
+                kind: error.kind(),
                 error: error.to_string(),
             });
         }
@@ -428,6 +500,7 @@ fn matching_slot_ancestor_paths(
     for entry in entries {
         let entry = entry.map_err(|error| PcieLinkUnknown::UnreadableField {
             path: slots_dir.clone(),
+            kind: error.kind(),
             error: error.to_string(),
         })?;
         let address_path = entry.path().join("address");
@@ -437,6 +510,7 @@ fn matching_slot_ancestor_paths(
             Err(error) => {
                 return Err(PcieLinkUnknown::UnreadableField {
                     path: address_path,
+                    kind: error.kind(),
                     error: error.to_string(),
                 });
             }
@@ -461,6 +535,7 @@ fn read_link_fields(path: &Path) -> Result<(LinkSpeed, u16), PcieLinkUnknown> {
     let speed_text =
         fs::read_to_string(&speed_path).map_err(|error| PcieLinkUnknown::UnreadableField {
             path: speed_path,
+            kind: error.kind(),
             error: error.to_string(),
         })?;
     let Some(speed) = parse_link_speed(&speed_text) else {
@@ -473,6 +548,7 @@ fn read_link_fields(path: &Path) -> Result<(LinkSpeed, u16), PcieLinkUnknown> {
     let width_text =
         fs::read_to_string(&width_path).map_err(|error| PcieLinkUnknown::UnreadableField {
             path: width_path,
+            kind: error.kind(),
             error: error.to_string(),
         })?;
     let Some(width) = parse_link_width(&width_text) else {
@@ -720,6 +796,9 @@ mod tests {
 
         assert_eq!(address.sysfs_name(), "0000:03:00.1");
         assert_eq!(address.to_string(), "0000:03:00.1");
+        assert_eq!(PciAddress::parse("0000:03:00.1"), Some(address));
+        assert_eq!(PciAddress::parse("0000:03:20.0"), None);
+        assert_eq!(PciAddress::parse("0000:03:00"), None);
     }
 
     #[test]

@@ -166,8 +166,7 @@ For every ordered device pair, `xfer` calls `zeDeviceCanAccessPeer`.
 allocations owned by different devices. `peer-access=yes` or `no` is a separate
 capability result. Neither observation proves whether the physical path was
 device-to-device, traversed a host bridge, or was internally staged by the
-driver. A Level Zero trace or platform counter is required to prove the route.
-`xfer` does not currently collect those traces or counters.
+driver.
 
 The reported PCIe topology is derived from endpoint ancestry in sysfs. It
 distinguishes a common root port, a shared upstream bridge, different root
@@ -182,6 +181,73 @@ rejected merely because source and destination queue group IDs differ.
 
 `explicit-staged` has a narrower meaning: `xfer` itself issued D2H and H2D legs
 through pinned host memory with an explicit barrier between them.
+
+## P2P diagnostics
+
+`xfer diag-p2p --device A --peer-device B` adds platform evidence without
+changing the default `bench` behavior. Diagnostic defaults are intentionally
+separate from benchmark defaults: 1 GiB, 50 samples, and a 1-second warm-up
+unless explicitly overridden with `--size`, `--samples`, or `--warmup`. It runs:
+
+1. An explicit-staged calibration with IIO memory read/write counters.
+2. A direct-copy pass with the same memory counters.
+3. Repeated direct-copy passes for available peer-write, peer-read, and
+   optional UPI counter roles.
+4. ACS extended-capability reads on the endpoint bridge ancestry.
+
+ACS is sampled immediately after Level Zero discovery and again after the
+measured phases. If bridge evidence changes, the final register values are
+reported but ACS does not qualify the verdict. Because `devN` is a Level Zero
+enumeration index, xfer cannot read the selected bridge path before opening
+Level Zero. An external before/after register read is required to detect a
+policy restoration caused by that initial device discovery.
+
+Only measured submit-and-synchronize intervals are observed by the counters.
+Allocation, command recording, destination poisoning, and verification remain
+outside each counter window. Five idle windows establish a per-phase noise
+baseline. Counter decisions use exact integer deltas and reject multiplexed,
+zero-running, incomplete, overflowed, or topology-inconsistent evidence.
+
+The default human report is concise and operator-focused: verdict/mechanism,
+host-memory counter status, direct versus explicit-staged bandwidth with compact
+distributions, route/link context, evidence availability, and actionable
+caveats. `--details` reveals raw gate messages, counter role summaries, and ACS
+bridge rows. CSV keeps a stable machine-readable summary, including every ACS
+bridge outcome and path, for scripts.
+
+A peer counter signal is not enough by itself. A `counter-consistent-peer`
+verdict also requires calibrated direct-memory events with valid repeats whose
+p90 remains within the idle baseline plus 5% of expected transfer traffic.
+Unavailable direct-memory evidence therefore cannot be mistaken for evidence
+that host traffic was absent.
+
+The Linux uncore counters are system-wide rather than transaction-tagged to a
+Level Zero device pair. Hardware counter restrictions also require separate
+repeated passes for memory and peer event sets. For those reasons the strongest
+labels are `counter-consistent-peer`,
+`counter-consistent-host-memory-traffic`, and
+`mixed-signals-across-repeated-runs`, not route proof. Run the command while
+other GPU and high-volume I/O activity is idle.
+
+The compiled-in profiles cover Intel SPR-X model `0x8f`, GNR-X model `0xad`,
+and GNR-D model `0xae`. Events and map rows are minimal extracts from
+`intel/perfmon`; provenance and license details live in
+`vendor/intel-perfmon/README.md` and source metadata. The runtime packs source
+fields through the PMU format exported by sysfs instead of hard-coding Linux bit
+positions.
+
+ACS lives in PCIe extended config space. A short config read is reported as
+extended config unavailable, not as no ACS capability. Request Redirect and
+Completion Redirect are routing-policy evidence. Egress Control is decoded but
+is not called redirect without interpreting an egress vector. No ACS redirect
+observation is proof of a direct data path, and an ACS redirect observation is
+not proof of host-memory staging.
+
+`diag-p2p` does not auto-elevate. If `perf_event_open` or bridge config reads are
+permission-limited, the report preserves that state and prints a same-settings
+command using the current executable path for an explicit sudo rerun. Loader
+or runtime setup failures must be fixed in the invoking environment; sudo is
+not treated as a loader repair mechanism.
 
 ## Comparison with ze_peer
 

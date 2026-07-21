@@ -187,7 +187,7 @@ fn pcie_unknown_reason(reason: &PcieLinkUnknown) -> String {
         PcieLinkUnknown::UnreliableDevicePath(path) => {
             format!("unreliable sysfs PCI device path {}", path.display())
         }
-        PcieLinkUnknown::UnreadableField { path, error } => {
+        PcieLinkUnknown::UnreadableField { path, error, .. } => {
             format!("cannot read {}: {error}", path.display())
         }
         PcieLinkUnknown::UnrecognizedSpeed(speed) => {

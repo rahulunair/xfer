@@ -16,6 +16,7 @@ mod error;
 mod event;
 mod execute;
 mod host;
+pub(crate) mod measurement;
 mod plan;
 mod sampling;
 mod saturation;
@@ -32,6 +33,7 @@ use self::error::CaseExecutionError;
 pub use self::error::{BenchmarkError, Result};
 pub use self::event::{BenchEvent, CaseId, NoopReport, Report};
 use self::event::{BenchEvent as Event, EventFanout, ExecutionEvent};
+use self::measurement::{MeasurementObserver, NoopMeasurementObserver as NoopMeasurement};
 use self::plan::{joined_skip_reasons, plan_cases, validate_filters};
 use self::topology::discover_topology;
 
@@ -51,6 +53,18 @@ pub fn bench_with_reporter<R>(options: &BenchOptions, mut reporter: R) -> Result
 where
     R: Report,
 {
+    let mut observer = NoopMeasurement;
+    bench_with_reporter_and_observer(options, &mut reporter, &mut observer)
+}
+
+pub(crate) fn bench_with_reporter_and_observer<R>(
+    options: &BenchOptions,
+    reporter: &mut R,
+    observer: &mut dyn MeasurementObserver,
+) -> Result<BenchReport>
+where
+    R: Report,
+{
     validate_options(options)?;
     let topology = discover_topology()?;
     if topology.devices.is_empty() {
@@ -64,7 +78,7 @@ where
     let total = plans.len();
     let system = system_info(&topology, &plans);
     let mut cases = Vec::with_capacity(total);
-    let mut fanout = EventFanout::new(&mut reporter);
+    let mut fanout = EventFanout::new(reporter);
 
     fanout.emit(Event::TopologyPlanned {
         system: &system,
@@ -86,7 +100,14 @@ where
         } else {
             {
                 let mut events = |event| emit_execution_event(&mut fanout, &id, event);
-                match execute::execute_case(&topology, &plan, options, byte_count, &mut events) {
+                match execute::execute_case(
+                    &topology,
+                    &plan,
+                    options,
+                    byte_count,
+                    &mut events,
+                    observer,
+                ) {
                     Ok(outcome) => outcome,
                     Err(CaseExecutionError::Skip(reason)) => CaseOutcome::Skipped { reason },
                     Err(CaseExecutionError::Fatal(error)) => {

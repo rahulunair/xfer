@@ -7,6 +7,7 @@ use crate::level_zero as ze;
 use crate::output::Operation;
 
 use super::error::{BenchmarkError, CaseExecutionError, ze_fatal};
+use super::measurement::{MeasurementObserver, SampleContext, observe_sample};
 use super::plan::CasePlan;
 
 pub(crate) const QUEUE_SYNC_TIMEOUT_NS: u64 = u64::MAX;
@@ -133,6 +134,57 @@ pub(crate) fn sample_d2d(
     }
 }
 
+pub(crate) fn sample_d2d_observed(
+    timing: TimingMode,
+    queue: &ze::CommandQueue<'_>,
+    list: &ze::CommandList<'_>,
+    dst: &ze::DeviceAllocation<'_>,
+    src: &ze::DeviceAllocation<'_>,
+    bytes: usize,
+    timestamp_event: Option<&ze::Event<'_>>,
+    properties: &ze::DeviceProperties,
+    plan: &CasePlan,
+    observer: &mut dyn MeasurementObserver,
+    context: &SampleContext,
+) -> std::result::Result<Duration, CaseExecutionError> {
+    match timing {
+        TimingMode::WallClock => {
+            prepare_d2d_list(list, dst, src, bytes, None).map_err(|error| {
+                timestamp_level_zero_error("record direct device-to-device copy", error)
+            })?;
+            observe_sample(observer, context, || {
+                let started = Instant::now();
+                queue.execute(&[list]).map_err(|error| {
+                    timestamp_level_zero_error("execute direct device-to-device copy", error)
+                })?;
+                queue.synchronize(QUEUE_SYNC_TIMEOUT_NS).map_err(|error| {
+                    timestamp_level_zero_error("synchronize direct device-to-device copy", error)
+                })?;
+                Ok(started.elapsed())
+            })
+        }
+        TimingMode::DeviceTimestamps => {
+            let event = require_timestamp_event(timestamp_event, plan)?;
+            event
+                .host_reset()
+                .map_err(|error| timestamp_level_zero_error("reset timestamp event", error))?;
+            prepare_d2d_list(list, dst, src, bytes, Some(event)).map_err(|error| {
+                timestamp_level_zero_error("record direct device-to-device copy", error)
+            })?;
+            let _ = observe_sample(observer, context, || {
+                queue.execute(&[list]).map_err(|error| {
+                    timestamp_level_zero_error("execute direct device-to-device copy", error)
+                })?;
+                queue.synchronize(QUEUE_SYNC_TIMEOUT_NS).map_err(|error| {
+                    timestamp_level_zero_error("synchronize direct device-to-device copy", error)
+                })?;
+                Ok(Duration::ZERO)
+            })?;
+            timestamp_duration(event, properties, plan)
+        }
+    }
+}
+
 fn time_direct_d2d_sync(
     queue: &ze::CommandQueue<'_>,
     list: &ze::CommandList<'_>,
@@ -213,6 +265,10 @@ fn timestamp_level_zero_error(
     phase: &'static str,
     error: ze::LevelZeroError,
 ) -> CaseExecutionError {
+    CaseExecutionError::Fatal(BenchmarkError::LevelZeroOperation { phase, error })
+}
+
+fn level_zero_error(phase: &'static str, error: ze::LevelZeroError) -> CaseExecutionError {
     CaseExecutionError::Fatal(BenchmarkError::LevelZeroOperation { phase, error })
 }
 
@@ -393,7 +449,7 @@ pub(crate) fn copy_staged_sync(
     destination_queue.synchronize(QUEUE_SYNC_TIMEOUT_NS)
 }
 
-pub(crate) fn time_staged_sync(
+pub(crate) fn time_staged_sync_observed(
     source_queue: &ze::CommandQueue<'_>,
     source_list: &ze::CommandList<'_>,
     destination_queue: &ze::CommandQueue<'_>,
@@ -402,7 +458,9 @@ pub(crate) fn time_staged_sync(
     source: &ze::DeviceAllocation<'_>,
     destination: &ze::DeviceAllocation<'_>,
     bytes: usize,
-) -> ze::Result<Duration> {
+    observer: &mut dyn MeasurementObserver,
+    context: &SampleContext,
+) -> std::result::Result<Duration, CaseExecutionError> {
     prepare_staged_lists(
         source_list,
         destination_list,
@@ -410,15 +468,26 @@ pub(crate) fn time_staged_sync(
         source,
         destination,
         bytes,
-    )?;
-    let started = Instant::now();
-    source_queue.execute(&[source_list])?;
-    // The explicit staged sample is end-to-end: D2H must complete before the
-    // H2D leg reads the pinned staging buffer.
-    source_queue.synchronize(QUEUE_SYNC_TIMEOUT_NS)?;
-    destination_queue.execute(&[destination_list])?;
-    destination_queue.synchronize(QUEUE_SYNC_TIMEOUT_NS)?;
-    Ok(started.elapsed())
+    )
+    .map_err(|error| level_zero_error("sample explicit staged copy", error))?;
+    observe_sample(observer, context, || {
+        let started = Instant::now();
+        source_queue
+            .execute(&[source_list])
+            .map_err(|error| level_zero_error("sample explicit staged copy", error))?;
+        // The explicit staged sample is end-to-end: D2H must complete before the
+        // H2D leg reads the pinned staging buffer.
+        source_queue
+            .synchronize(QUEUE_SYNC_TIMEOUT_NS)
+            .map_err(|error| level_zero_error("sample explicit staged copy", error))?;
+        destination_queue
+            .execute(&[destination_list])
+            .map_err(|error| level_zero_error("sample explicit staged copy", error))?;
+        destination_queue
+            .synchronize(QUEUE_SYNC_TIMEOUT_NS)
+            .map_err(|error| level_zero_error("sample explicit staged copy", error))?;
+        Ok(started.elapsed())
+    })
 }
 
 fn prepare_staged_lists(

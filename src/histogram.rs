@@ -99,7 +99,8 @@ impl Histogram {
         let labels = self
             .bins
             .iter()
-            .map(|bin| format_label(bin.lower, label_decimals))
+            .enumerate()
+            .map(|(index, bin)| format_bin_label(bin, index + 1 == self.bins.len(), label_decimals))
             .collect::<Vec<_>>();
         let label_width = labels.iter().map(String::len).max().unwrap_or(0);
 
@@ -125,14 +126,25 @@ impl Histogram {
     }
 
     pub fn render_ascii(&self, max_bar_width: usize, median: Option<f64>) -> Option<Vec<String>> {
+        let rows = self.rows(max_bar_width, median)?;
+        let count_width = rows
+            .iter()
+            .map(|row| row.count.to_string().len())
+            .max()
+            .unwrap_or(1);
         Some(
-            self.rows(max_bar_width, median)?
-                .into_iter()
+            rows.into_iter()
                 .map(|row| {
                     if row.marks_median {
-                        format!("{} | {}  median", row.label, row.bar)
+                        format!(
+                            "{} | {:<max_bar_width$} {:>count_width$}  median",
+                            row.label, row.bar, row.count
+                        )
                     } else {
-                        format!("{} | {}", row.label, row.bar)
+                        format!(
+                            "{} | {:<max_bar_width$} {:>count_width$}",
+                            row.label, row.bar, row.count
+                        )
                     }
                 })
                 .collect(),
@@ -166,7 +178,16 @@ fn label_decimals(bins: &[HistogramBin]) -> usize {
     }
 
     for decimals in 1..=6 {
-        let mut labels = bins.iter().map(|bin| format_label(bin.lower, decimals));
+        if bins.iter().any(|bin| {
+            bin.lower != bin.upper
+                && format_label(bin.lower, decimals) == format_label(bin.upper, decimals)
+        }) {
+            continue;
+        }
+        let mut labels = bins
+            .iter()
+            .enumerate()
+            .map(|(index, bin)| format_bin_label(bin, index + 1 == bins.len(), decimals));
         let Some(mut previous) = labels.next() else {
             return 1;
         };
@@ -193,6 +214,19 @@ fn format_label(value: f64, decimals: usize) -> String {
     } else {
         rounded
     }
+}
+
+fn format_bin_label(bin: &HistogramBin, final_bin: bool, decimals: usize) -> String {
+    if bin.lower == bin.upper {
+        return format!("[{}]", format_label(bin.lower, decimals));
+    }
+
+    format!(
+        "[{}, {}{}",
+        format_label(bin.lower, decimals),
+        format_label(bin.upper, decimals),
+        if final_bin { "]" } else { ")" }
+    )
 }
 
 fn scaled_bar_len(count: usize, max_count: usize, max_bar_width: usize) -> usize {
@@ -311,13 +345,13 @@ mod tests {
             rows,
             vec![
                 HistogramRow {
-                    label: "0.0".to_owned(),
+                    label: "[0.0, 1.0)".to_owned(),
                     bar: "#####".to_owned(),
                     count: 2,
                     marks_median: false
                 },
                 HistogramRow {
-                    label: "1.0".to_owned(),
+                    label: "[1.0, 2.0]".to_owned(),
                     bar: "##########".to_owned(),
                     count: 4,
                     marks_median: false
@@ -332,7 +366,7 @@ mod tests {
         let rows = histogram.rows(8, Some(2.0)).unwrap();
 
         assert_eq!(rows.iter().filter(|row| row.marks_median).count(), 1);
-        assert_eq!(rows[2].label, "1.5");
+        assert_eq!(rows[2].label, "[1.5, 2.2)");
         assert!(rows[2].marks_median);
     }
 
@@ -352,7 +386,10 @@ mod tests {
 
         assert_eq!(
             lines,
-            vec![" 9.0 | ##".to_owned(), "10.0 | ######  median".to_owned()]
+            vec![
+                " [9.0, 10.0) | ##     1".to_owned(),
+                "[10.0, 11.0] | ###### 3  median".to_owned()
+            ]
         );
     }
 
@@ -361,9 +398,9 @@ mod tests {
         let histogram = Histogram::from_samples(&[13.801, 13.804, 13.807, 13.810], 3).unwrap();
         let rows = histogram.rows(6, None).unwrap();
 
-        assert_eq!(rows[0].label, "13.801");
-        assert_eq!(rows[1].label, "13.804");
-        assert_eq!(rows[2].label, "13.807");
+        assert_eq!(rows[0].label, "[13.801, 13.804)");
+        assert_eq!(rows[1].label, "[13.804, 13.807)");
+        assert_eq!(rows[2].label, "[13.807, 13.810]");
     }
 
     #[test]

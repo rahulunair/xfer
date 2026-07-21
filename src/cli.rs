@@ -13,6 +13,8 @@ pub const VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
 
 pub const DEFAULT_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_SAMPLES: u32 = 50;
+pub const DIAG_DEFAULT_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DIAG_DEFAULT_SAMPLES: u32 = 50;
 pub const MIN_SAMPLES: u32 = 10;
 pub const DEFAULT_WARMUP: Duration = Duration::from_secs(1);
 
@@ -27,6 +29,7 @@ pub enum CliAction {
 pub enum Command {
     List(ListOptions),
     Bench(BenchOptions),
+    DiagP2p(DiagP2pOptions),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -46,6 +49,33 @@ pub struct BenchOptions {
     pub histogram: bool,
     pub summary_only: bool,
     pub mode: BenchMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagP2pOptions {
+    pub device: u32,
+    pub peer_device: u32,
+    pub queue_group: Option<u32>,
+    pub size_bytes: u64,
+    pub samples: u32,
+    pub warmup: Duration,
+    pub format: OutputFormat,
+    pub details: bool,
+}
+
+impl DiagP2pOptions {
+    fn from_required_devices(device: u32, peer_device: u32) -> Self {
+        Self {
+            device,
+            peer_device,
+            queue_group: None,
+            size_bytes: DIAG_DEFAULT_SIZE_BYTES,
+            samples: DIAG_DEFAULT_SAMPLES,
+            warmup: DEFAULT_WARMUP,
+            format: OutputFormat::Text,
+            details: false,
+        }
+    }
 }
 
 impl Default for BenchOptions {
@@ -162,6 +192,7 @@ pub enum HelpTopic {
     General,
     List,
     Bench,
+    DiagP2p,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,6 +238,7 @@ pub fn help(topic: HelpTopic) -> &'static str {
         HelpTopic::General => GENERAL_HELP,
         HelpTopic::List => LIST_HELP,
         HelpTopic::Bench => BENCH_HELP,
+        HelpTopic::DiagP2p => DIAG_P2P_HELP,
     }
 }
 
@@ -228,6 +260,7 @@ fn parse_tokens(args: &[String]) -> Result<CliAction, CliError> {
         "-V" | "--version" => require_no_extra(args, first).map(|()| CliAction::Version),
         "list" => parse_list(&args[1..]),
         "bench" => parse_bench(&args[1..]),
+        "diag-p2p" => parse_diag_p2p(&args[1..]),
         value if value.starts_with('-') => Err(CliError::new(format!(
             "missing command before option '{value}'\n\nRun '{PROGRAM_NAME} --help' for usage."
         ))),
@@ -245,6 +278,140 @@ fn parse_list(args: &[String]) -> Result<CliAction, CliError> {
         [arg, ..] => Err(CliError::new(format!(
             "unexpected argument for 'list': '{arg}'\n\nRun '{PROGRAM_NAME} list --help' for usage."
         ))),
+    }
+}
+
+fn parse_diag_p2p(args: &[String]) -> Result<CliAction, CliError> {
+    let mut state = DiagP2pParseState::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "-h" || arg == "--help" {
+            require_no_remaining(args, index, arg)?;
+            return Ok(CliAction::Help(HelpTopic::DiagP2p));
+        }
+        if arg == "-V" || arg == "--version" {
+            require_no_remaining(args, index, arg)?;
+            return Ok(CliAction::Version);
+        }
+
+        apply_diag_p2p_option(args, &mut index, parse_long_option(arg)?, &mut state)?;
+        index += 1;
+    }
+
+    finalize_diag_p2p_options(&state).map(|options| CliAction::Command(Command::DiagP2p(options)))
+}
+
+#[derive(Default)]
+struct DiagP2pParseState {
+    device: Option<u32>,
+    peer_device: Option<u32>,
+    queue_group: Option<u32>,
+    size_bytes: Option<u64>,
+    samples: Option<u32>,
+    warmup: Option<Duration>,
+    format: Option<OutputFormat>,
+    details: bool,
+}
+
+fn apply_diag_p2p_option(
+    args: &[String],
+    index: &mut usize,
+    parsed: ParsedOption<'_>,
+    state: &mut DiagP2pParseState,
+) -> Result<(), CliError> {
+    let ParsedOption { name, value } = parsed;
+    match name {
+        "--device" => {
+            reject_duplicate(state.device.is_some(), name)?;
+            let value = take_option_value(args, index, name, value)?;
+            state.device = Some(parse_u32(&value, name)?);
+        }
+        "--peer-device" => {
+            reject_duplicate(state.peer_device.is_some(), name)?;
+            let value = take_option_value(args, index, name, value)?;
+            state.peer_device = Some(parse_u32(&value, name)?);
+        }
+        "--queue-group" => {
+            reject_duplicate(state.queue_group.is_some(), name)?;
+            let value = take_option_value(args, index, name, value)?;
+            state.queue_group = Some(parse_u32(&value, name)?);
+        }
+        "--size" => {
+            reject_duplicate(state.size_bytes.is_some(), name)?;
+            let value = take_option_value(args, index, name, value)?;
+            state.size_bytes = Some(parse_size_bytes(&value)?);
+        }
+        "--samples" => {
+            reject_duplicate(state.samples.is_some(), name)?;
+            let value = take_option_value(args, index, name, value)?;
+            state.samples = Some(parse_sample_count(&value, name)?);
+        }
+        "--warmup" => {
+            reject_duplicate(state.warmup.is_some(), name)?;
+            let value = take_option_value(args, index, name, value)?;
+            state.warmup = Some(parse_duration(&value)?);
+        }
+        "--format" => {
+            reject_duplicate(state.format.is_some(), name)?;
+            let value = take_option_value(args, index, name, value)?;
+            state.format = Some(parse_output_format(&value)?);
+        }
+        "--details" => {
+            reject_option_value(name, value)?;
+            reject_duplicate(state.details, name)?;
+            state.details = true;
+        }
+        _ => {
+            return Err(CliError::new(format!(
+                "unknown option for 'diag-p2p': '{name}'\n\nRun '{PROGRAM_NAME} diag-p2p --help' for usage."
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn finalize_diag_p2p_options(state: &DiagP2pParseState) -> Result<DiagP2pOptions, CliError> {
+    let device = state.device.ok_or_else(|| {
+        CliError::new(format!(
+            "missing required option '--device'\n\nRun '{PROGRAM_NAME} diag-p2p --help' for usage."
+        ))
+    })?;
+    let peer_device = state.peer_device.ok_or_else(|| {
+        CliError::new(format!(
+            "missing required option '--peer-device'\n\nRun '{PROGRAM_NAME} diag-p2p --help' for usage."
+        ))
+    })?;
+    if device == peer_device {
+        return Err(CliError::new(
+            "'--device' and '--peer-device' must be distinct for 'diag-p2p'",
+        ));
+    }
+
+    let mut options = DiagP2pOptions::from_required_devices(device, peer_device);
+    options.queue_group = state.queue_group;
+    options.size_bytes = state.size_bytes.unwrap_or(DIAG_DEFAULT_SIZE_BYTES);
+    options.samples = state.samples.unwrap_or(DIAG_DEFAULT_SAMPLES);
+    options.warmup = state.warmup.unwrap_or(DEFAULT_WARMUP);
+    options.format = state.format.unwrap_or(OutputFormat::Text);
+    options.details = state.details;
+    if options.details && options.format == OutputFormat::Csv {
+        return Err(CliError::new(
+            "'--details' requires '--format text' for 'diag-p2p'",
+        ));
+    }
+    Ok(options)
+}
+
+fn reject_duplicate(already_present: bool, name: &str) -> Result<(), CliError> {
+    if already_present {
+        Err(CliError::new(format!(
+            "option '{name}' was provided more than once"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -596,17 +763,20 @@ xfer - measure Intel Level Zero transfer performance
 Usage:
   xfer list
   xfer bench [OPTIONS]
+  xfer diag-p2p --device N --peer-device N [OPTIONS]
   xfer --help
   xfer --version
 
 Commands:
-  list    Show GPUs, queue groups, peer access, and PCIe routes
-  bench   Measure sustained direct GPU-to-GPU bandwidth
+  list      Show GPUs, queue groups, peer access, and PCIe routes
+  bench     Measure sustained Level Zero direct GPU-memory copy request bandwidth
+  diag-p2p  Diagnose peer-counter vs host-memory-counter evidence
 
 Common examples:
   xfer bench
   xfer bench --summary-only
   xfer bench --device 0 --peer-device 1
+  xfer diag-p2p --device 0 --peer-device 1
 
 Options:
   -h, --help       Print help
@@ -629,8 +799,9 @@ const BENCH_HELP: &str = "\
 Usage:
   xfer bench [OPTIONS]
 
-With no options, xfer measures direct GPU-to-GPU saturation bandwidth for every
-ordered device pair. Defaults: all copy queues, 2 GiB, 50 samples, 1 s warm-up.
+With no options, xfer measures Level Zero direct GPU-memory copy request
+saturation bandwidth for every ordered device pair. Defaults: all copy queues,
+2 GiB, 50 samples, 1 s warm-up.
 
 Common options:
       --summary-only              Print only the final report
@@ -648,6 +819,40 @@ Advanced filters:
       --samples N                 Sample count, minimum 10; default 50
       --warmup DURATION           Warm-up duration, e.g. 500ms, 1s; default 1s
       --timing MODE               wall-clock or device-timestamps
+
+  -h, --help                      Print help
+  -V, --version                   Print version
+";
+
+const DIAG_P2P_HELP: &str = "\
+Usage:
+  xfer diag-p2p --device N --peer-device N [OPTIONS]
+
+Diagnose whether a Level Zero direct GPU-memory copy request is more consistent
+with peer traffic or explicit host staging. The direct request and peer-access
+API capability are evidence inputs, not proof of the physical data route.
+diag-p2p calibrates explicit host staging, then checks direct-copy IIO memory
+and peer counters plus live PCIe topology, endpoint links, and ACS policy.
+Its strongest result is counter-consistent evidence; it cannot prove a precise
+physical packet route without transaction-tagged telemetry or external tracing.
+
+Options:
+      --device N                  Source device index shown by 'xfer list'
+      --peer-device N             Destination peer device index; must differ
+      --queue-group ID            Select the queue group shown by 'xfer list'
+      --size BYTES                Payload size, e.g. 1GiB, 512MiB; default 1GiB
+      --samples N                 Sample count, minimum 10; default 50
+      --warmup DURATION           Warm-up duration, e.g. 500ms, 1s; default 1s
+      --format FORMAT             text or csv; default text
+      --details                   Include raw gate reasons, counter roles, and bridge rows; text only
+
+Strongest counter and ACS evidence may require rerunning the absolute release
+binary with sudo, for example:
+  sudo /absolute/path/to/xfer diag-p2p --device N --peer-device N
+
+Without access, ACS and counter evidence are reported unavailable and the
+verdict degrades. sudo is not a remedy for loader startup or environment setup
+failures.
 
   -h, --help                      Print help
   -V, --version                   Print version
@@ -700,6 +905,14 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_defaults_are_separate_named_values() {
+        assert_eq!(DEFAULT_SIZE_BYTES, 2 * 1024 * 1024 * 1024);
+        assert_eq!(DEFAULT_SAMPLES, 50);
+        assert_eq!(DIAG_DEFAULT_SIZE_BYTES, 1024 * 1024 * 1024);
+        assert_eq!(DIAG_DEFAULT_SAMPLES, 50);
+    }
+
+    #[test]
     fn parses_bench_filters_and_output_flags() {
         let action = parse_ok(&[
             "bench",
@@ -741,6 +954,183 @@ mod tests {
                 mode: BenchMode::Single,
             }))
         );
+    }
+
+    #[test]
+    fn parses_diag_p2p_defaults() {
+        let action = parse_ok(&["diag-p2p", "--device", "0", "--peer-device", "1"]);
+
+        assert_eq!(
+            action,
+            CliAction::Command(Command::DiagP2p(DiagP2pOptions {
+                device: 0,
+                peer_device: 1,
+                queue_group: None,
+                size_bytes: DIAG_DEFAULT_SIZE_BYTES,
+                samples: DIAG_DEFAULT_SAMPLES,
+                warmup: DEFAULT_WARMUP,
+                format: OutputFormat::Text,
+                details: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_diag_p2p_options() {
+        let action = parse_ok(&[
+            "diag-p2p",
+            "--device=2",
+            "--peer-device",
+            "0",
+            "--queue-group",
+            "3",
+            "--size",
+            "512MiB",
+            "--samples",
+            "64",
+            "--warmup",
+            "750ms",
+            "--details",
+        ]);
+
+        assert_eq!(
+            action,
+            CliAction::Command(Command::DiagP2p(DiagP2pOptions {
+                device: 2,
+                peer_device: 0,
+                queue_group: Some(3),
+                size_bytes: 512 * 1024 * 1024,
+                samples: 64,
+                warmup: Duration::from_millis(750),
+                format: OutputFormat::Text,
+                details: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn diag_p2p_details_is_text_only() {
+        for args in [
+            [
+                "diag-p2p",
+                "--device",
+                "0",
+                "--peer-device",
+                "1",
+                "--details",
+                "--format=csv",
+            ],
+            [
+                "diag-p2p",
+                "--device",
+                "0",
+                "--peer-device",
+                "1",
+                "--format=csv",
+                "--details",
+            ],
+        ] {
+            assert!(parse_err(&args).contains("requires '--format text'"));
+        }
+    }
+
+    #[test]
+    fn diag_p2p_requires_both_distinct_devices() {
+        assert!(parse_err(&["diag-p2p", "--peer-device", "1"]).contains("--device"));
+        assert!(parse_err(&["diag-p2p", "--device", "0"]).contains("--peer-device"));
+        assert!(
+            parse_err(&["diag-p2p", "--device", "1", "--peer-device", "1"]).contains("distinct")
+        );
+    }
+
+    #[test]
+    fn diag_p2p_rejects_duplicates_and_bad_values() {
+        assert!(
+            parse_err(&[
+                "diag-p2p",
+                "--device",
+                "0",
+                "--device",
+                "1",
+                "--peer-device",
+                "2",
+            ])
+            .contains("more than once")
+        );
+        assert!(
+            parse_err(&[
+                "diag-p2p",
+                "--device",
+                "0",
+                "--peer-device",
+                "1",
+                "--queue-group",
+                "x",
+            ])
+            .contains("unsigned integer")
+        );
+        assert!(
+            parse_err(&[
+                "diag-p2p",
+                "--device",
+                "0",
+                "--peer-device",
+                "1",
+                "--size",
+                "4XB",
+            ])
+            .contains("invalid size unit")
+        );
+        assert!(
+            parse_err(&[
+                "diag-p2p",
+                "--device",
+                "0",
+                "--peer-device",
+                "1",
+                "--samples",
+                "9",
+            ])
+            .contains("at least 10")
+        );
+        assert!(
+            parse_err(&[
+                "diag-p2p",
+                "--device",
+                "0",
+                "--peer-device",
+                "1",
+                "--format",
+                "json",
+            ])
+            .contains("invalid format")
+        );
+    }
+
+    #[test]
+    fn diag_p2p_accepts_help_and_version_only_as_terminal_flags() {
+        assert_eq!(
+            parse_ok(&["diag-p2p", "--help"]),
+            CliAction::Help(HelpTopic::DiagP2p)
+        );
+        assert_eq!(parse_ok(&["diag-p2p", "--version"]), CliAction::Version);
+        assert!(
+            parse_err(&["diag-p2p", "--help", "--device", "0"]).contains("does not take arguments")
+        );
+    }
+
+    #[test]
+    fn diag_p2p_has_exact_public_command_spelling() {
+        assert!(
+            parse_ok(&["diag-p2p", "--device", "0", "--peer-device", "1"]).eq(&CliAction::Command(
+                Command::DiagP2p(DiagP2pOptions::from_required_devices(0, 1),)
+            ))
+        );
+        assert!(parse_err(&["diagnose-p2p"]).contains("unknown command"));
+        assert!(parse_err(&["diag-p2p", "--class", "all"]).contains("unknown option"));
+        assert!(parse_err(&["diag-p2p", "--single"]).contains("unknown option"));
+        assert!(parse_err(&["diag-p2p", "--timing", "wall-clock"]).contains("unknown option"));
+        assert!(parse_err(&["diag-p2p", "--no-histogram"]).contains("unknown option"));
     }
 
     #[test]
@@ -858,13 +1248,24 @@ mod tests {
     fn embedded_help_mentions_required_commands_and_flags() {
         assert!(help(HelpTopic::General).contains("xfer list"));
         assert!(help(HelpTopic::General).contains("xfer bench"));
+        assert!(help(HelpTopic::General).contains("xfer diag-p2p"));
+        assert!(help(HelpTopic::General).contains("host-memory-counter evidence"));
+        assert!(!help(HelpTopic::General).contains("direct GPU-to-GPU"));
         assert!(help(HelpTopic::Bench).contains("device-timestamps"));
         assert!(help(HelpTopic::Bench).contains("--format FORMAT"));
         assert!(help(HelpTopic::Bench).contains("--summary-only"));
         assert!(help(HelpTopic::Bench).contains("--single"));
         assert!(help(HelpTopic::Bench).contains("--queue-group ID"));
+        assert!(!help(HelpTopic::Bench).contains("direct GPU-to-GPU"));
         assert!(!help(HelpTopic::Bench).contains("--engine"));
         assert!(help(HelpTopic::Bench).contains("default 2GiB"));
+        assert!(help(HelpTopic::DiagP2p).contains("sudo /absolute/path/to/xfer diag-p2p"));
+        assert!(help(HelpTopic::DiagP2p).contains("not proof of the physical data route"));
+        assert!(help(HelpTopic::DiagP2p).contains("default 1GiB"));
+        assert!(help(HelpTopic::DiagP2p).contains("default 50"));
+        assert!(help(HelpTopic::DiagP2p).contains("--details"));
+        assert!(!help(HelpTopic::DiagP2p).contains("--single"));
+        assert!(!help(HelpTopic::DiagP2p).contains("--timing"));
         assert!(version().starts_with("xfer "));
     }
 }

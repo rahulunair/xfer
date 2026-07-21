@@ -6,10 +6,11 @@ use crate::output::CaseOutcome;
 use super::analyze::analyze_durations;
 use super::command::{
     copy_d2h_sync, copy_h2d_sync, copy_staged_sync, create_timestamp_event, create_timestamp_pool,
-    sample_d2d, sample_d2h, sample_h2d, time_staged_sync,
+    sample_d2d, sample_d2d_observed, sample_d2h, sample_h2d, time_staged_sync_observed,
 };
 use super::error::{CaseExecutionError, ze_fatal};
 use super::event::ExecutionEvent;
+use super::measurement::{MeasurementObserver, sample_context};
 use super::plan::{CasePlan, ExecutionPlan, STAGED_DEVICE_TIMESTAMP_SKIP_REASON};
 use super::sampling::{estimate_collection, sample_capacity, warmup};
 use super::saturation;
@@ -25,9 +26,10 @@ pub(crate) fn execute_case(
     options: &BenchOptions,
     bytes: usize,
     events: &mut dyn FnMut(ExecutionEvent),
+    observer: &mut dyn MeasurementObserver,
 ) -> std::result::Result<CaseOutcome, CaseExecutionError> {
     if options.mode == crate::cli::BenchMode::Saturation {
-        let durations = saturation::measure_case(topology, plan, options, bytes, events)?;
+        let durations = saturation::measure_case(topology, plan, options, bytes, events, observer)?;
         events(ExecutionEvent::Analysis);
         return analyze_durations(options.size_bytes, &durations, &plan.label());
     }
@@ -45,11 +47,29 @@ pub(crate) fn execute_case(
         ExecutionPlan::Direct {
             source,
             destination,
-        } => measure_direct(topology, plan, options, bytes, source, destination, events)?,
+        } => measure_direct(
+            topology,
+            plan,
+            options,
+            bytes,
+            source,
+            destination,
+            events,
+            observer,
+        )?,
         ExecutionPlan::Staged {
             source,
             destination,
-        } => measure_staged(topology, plan, options, bytes, source, destination, events)?,
+        } => measure_staged(
+            topology,
+            plan,
+            options,
+            bytes,
+            source,
+            destination,
+            events,
+            observer,
+        )?,
     };
 
     events(ExecutionEvent::Analysis);
@@ -357,7 +377,7 @@ fn measure_same_device(
     Ok(durations)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn measure_direct(
     topology: &Topology,
     plan: &CasePlan,
@@ -366,6 +386,7 @@ fn measure_direct(
     source_index: usize,
     destination_index: usize,
     events: &mut dyn FnMut(ExecutionEvent),
+    observer: &mut dyn MeasurementObserver,
 ) -> std::result::Result<Vec<Duration>, CaseExecutionError> {
     let source = &topology.devices[source_index];
     let destination = &topology.devices[destination_index];
@@ -467,7 +488,13 @@ fn measure_direct(
             ),
             "clear destination device buffer before sample",
         )?;
-        let elapsed = sample_d2d(
+        let context = sample_context(
+            crate::cli::TransferClass::D2DDirect,
+            options.size_bytes,
+            sample_index,
+            options.mode,
+        );
+        let elapsed = sample_d2d_observed(
             options.timing,
             &source_queue,
             &source_list,
@@ -477,6 +504,8 @@ fn measure_direct(
             timestamp_event.as_ref(),
             &source.properties,
             plan,
+            observer,
+            &context,
         )?;
         ze_fatal(
             copy_d2h_sync(
@@ -499,7 +528,7 @@ fn measure_direct(
     Ok(durations)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn measure_staged(
     topology: &Topology,
     plan: &CasePlan,
@@ -508,6 +537,7 @@ fn measure_staged(
     source_index: usize,
     destination_index: usize,
     events: &mut dyn FnMut(ExecutionEvent),
+    observer: &mut dyn MeasurementObserver,
 ) -> std::result::Result<Vec<Duration>, CaseExecutionError> {
     if options.timing == TimingMode::DeviceTimestamps {
         return Err(CaseExecutionError::Skip(
@@ -618,18 +648,23 @@ fn measure_staged(
             ),
             "clear destination device buffer before sample",
         )?;
-        let elapsed = ze_fatal(
-            time_staged_sync(
-                &source_queue,
-                &source_list,
-                &destination_queue,
-                &destination_list,
-                &mut staging,
-                &device_src,
-                &device_dst,
-                bytes,
-            ),
-            "sample explicit staged copy",
+        let context = sample_context(
+            crate::cli::TransferClass::D2DStaged,
+            options.size_bytes,
+            sample_index,
+            options.mode,
+        );
+        let elapsed = time_staged_sync_observed(
+            &source_queue,
+            &source_list,
+            &destination_queue,
+            &destination_list,
+            &mut staging,
+            &device_src,
+            &device_dst,
+            bytes,
+            observer,
+            &context,
         )?;
         ze_fatal(
             copy_d2h_sync(

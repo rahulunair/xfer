@@ -4,7 +4,7 @@ use super::model::{
 };
 use crate::cli::TransferClass;
 use crate::histogram::Histogram;
-use crate::stats::Summary;
+use crate::stats::{DistributionShape, Summary};
 
 pub fn render_list(report: &ListReport) -> String {
     let mut lines = Vec::new();
@@ -204,7 +204,7 @@ const SUMMARY_HEADERS: [&str; 7] = [
     "transfer",
     "path",
     "queue group(s)",
-    "median GB/s",
+    "rate GB/s",
     "p5..p95 GB/s",
     "MAD GB/s",
     "outliers",
@@ -219,10 +219,36 @@ fn render_summary_lines(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
     let mut lines = summary_heading(cases, color);
     let rows = cases.iter().map(summary_row).collect::<Vec<_>>();
     lines.extend(render_summary_table(&rows, color));
+    append_distribution_shape_notes(&mut lines, cases, color);
     append_skipped_cases(&mut lines, cases, color);
     lines.extend(render_p2p_facts(cases, color));
     append_summary_notes(&mut lines, cases, color);
     lines
+}
+
+fn append_distribution_shape_notes(lines: &mut Vec<String>, cases: &[BenchCase], color: ColorMode) {
+    for case in cases {
+        let CaseOutcome::Measured { summary, .. } = &case.outcome else {
+            continue;
+        };
+        let DistributionShape::SeparatedClusters(clusters) = summary.shape else {
+            continue;
+        };
+        lines.push(paint(
+            color,
+            "\u{1b}[1;33m",
+            &format!(
+                "  * {}: separated-cluster candidate near {} GB/s ({}/{}) and {} GB/s ({}/{}); causes are not identified",
+                summary_transfer(case),
+                format_nonzero_metric(clusters.lower_center, 1),
+                clusters.lower_count,
+                summary.count,
+                format_nonzero_metric(clusters.upper_center, 1),
+                clusters.upper_count,
+                summary.count
+            ),
+        ));
+    }
 }
 
 fn summary_heading(cases: &[BenchCase], color: ColorMode) -> Vec<String> {
@@ -405,10 +431,21 @@ fn append_summary_notes(lines: &mut Vec<String>, cases: &[BenchCase], color: Col
         ));
     }
     if has_direct {
+        let has_separated_clusters = cases.iter().any(|case| {
+            matches!(
+                &case.outcome,
+                CaseOutcome::Measured { summary, .. }
+                    if matches!(summary.shape, DistributionShape::SeparatedClusters(_))
+            )
+        });
         lines.push(paint(
             color,
             "\u{1b}[2m",
-            "  TP roofline: use the median as an isolated directional pair ceiling; collectives may be lower",
+            if has_separated_clusters {
+                "  TP roofline: separated clusters make one median misleading; report both cluster centers and investigate run-state changes"
+            } else {
+                "  TP roofline: use the median as an isolated directional pair ceiling; collectives may be lower"
+            },
         ));
     }
 }
@@ -423,7 +460,13 @@ fn summary_row(case: &BenchCase) -> SummaryRow {
             } => {
                 let [p5, median_with_unit, p95] =
                     format_rate_triplet([summary.p5, summary.median, summary.p95]);
-                let median = if matches!(case.operation, Operation::ExplicitStaged { .. }) {
+                let median = if let DistributionShape::SeparatedClusters(clusters) = summary.shape {
+                    format!(
+                        "~{} / ~{}*",
+                        format_nonzero_metric(clusters.lower_center, 1),
+                        format_nonzero_metric(clusters.upper_center, 1)
+                    )
+                } else if matches!(case.operation, Operation::ExplicitStaged { .. }) {
                     format!(
                         "{} payload / {} copy traffic",
                         rate_number(&median_with_unit),
@@ -560,7 +603,7 @@ pub(crate) fn status_label_from_case_id(id: &str) -> String {
     }
 }
 
-pub(crate) fn format_duration(duration: std::time::Duration) -> String {
+pub fn format_duration(duration: std::time::Duration) -> String {
     if duration.is_zero() {
         return "0 s".to_owned();
     }
@@ -579,7 +622,7 @@ pub(crate) fn format_duration(duration: std::time::Duration) -> String {
     format!("{} ns", format_human_decimal(duration.as_nanos() as f64, 2))
 }
 
-pub(crate) fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
@@ -754,6 +797,21 @@ fn render_measured_lines(
     options: &TextOptions,
 ) -> Vec<String> {
     let mut lines = vec![String::new()];
+    if let DistributionShape::SeparatedClusters(clusters) = summary.shape {
+        lines.push(paint(
+            options.color,
+            "\u{1b}[1;33m",
+            &format!(
+                "  distribution  separated-cluster candidate: ~{} GB/s ({}/{}) and ~{} GB/s ({}/{}); one median is not representative",
+                format_nonzero_metric(clusters.lower_center, 1),
+                clusters.lower_count,
+                summary.count,
+                format_nonzero_metric(clusters.upper_center, 1),
+                clusters.upper_count,
+                summary.count
+            ),
+        ));
+    }
     let time = format_seconds_triplet([
         time_summary.median_confidence.lower_bound,
         time_summary.median,
@@ -820,16 +878,17 @@ fn render_measured_lines(
     lines.push(paint(options.color, outlier_color, &outlier_line));
 
     if options.include_histogram {
-        append_histogram(&mut lines, samples_gb_s, summary.median, options.color);
+        append_histogram(&mut lines, samples_gb_s, summary, options.color);
     }
     lines
 }
 
-fn append_histogram(lines: &mut Vec<String>, samples: &[f64], median: f64, color: ColorMode) {
+fn append_histogram(lines: &mut Vec<String>, samples: &[f64], summary: &Summary, color: ColorMode) {
     let Some(histogram) = Histogram::from_samples(samples, 12) else {
         return;
     };
-    let Some(rows) = render_histogram(&histogram, Some(median), color) else {
+    let median = matches!(summary.shape, DistributionShape::Ordinary).then_some(summary.median);
+    let Some(rows) = render_histogram(&histogram, median, color) else {
         return;
     };
 
@@ -837,12 +896,15 @@ fn append_histogram(lines: &mut Vec<String>, samples: &[f64], median: f64, color
     lines.push(paint(
         color,
         "\u{1b}[1;36m",
-        &format!("  distribution  GB/s ({} samples)", histogram.sample_count),
+        &format!(
+            "  distribution  GB/s ({} samples; bars normalized within this chart)",
+            histogram.sample_count
+        ),
     ));
     lines.extend(rows.into_iter().map(|row| format!("    {row}")));
 }
 
-fn render_histogram(
+pub(crate) fn render_histogram(
     histogram: &Histogram,
     median: Option<f64>,
     color: ColorMode,
@@ -1177,7 +1239,7 @@ fn plural<'word>(count: usize, singular: &'word str, plural: &'word str) -> &'wo
     if count == 1 { singular } else { plural }
 }
 
-fn paint(color: ColorMode, code: &str, text: &str) -> String {
+pub(crate) fn paint(color: ColorMode, code: &str, text: &str) -> String {
     match color {
         ColorMode::Ansi => format!("{code}{text}\u{1b}[0m"),
         ColorMode::Never => text.to_owned(),

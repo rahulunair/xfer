@@ -24,11 +24,14 @@ The binary is installed to `~/.local/bin/xfer`.
 ```sh
 xfer list
 xfer bench
+xfer diag-p2p --device 0 --peer-device 1
 ```
 
 `xfer bench` measures every ordered GPU pair sequentially using direct Level
 Zero copies, all copy-capable queues, a 2 GiB payload, 50 samples, and a
 1-second warm-up. `--saturation` is accepted as an explicit form of the default.
+`xfer diag-p2p` keeps that benchmark behavior separate: its diagnostic default
+is a 1 GiB payload, 50 samples, and a 1-second warm-up.
 
 ## Common Commands
 
@@ -42,8 +45,29 @@ Zero copies, all copy-capable queues, a 2 GiB payload, 50 samples, and a
 | Measure explicit host staging | `xfer bench --class staged --summary-only` |
 | Full transfer matrix, compact report | `xfer bench --class all --summary-only` |
 | Stable machine-readable output | `xfer bench --format csv` |
+| Diagnose peer traffic versus host bounce | `xfer diag-p2p --device 0 --peer-device 1` |
+| Diagnostic raw evidence text | `xfer diag-p2p --device 0 --peer-device 1 --details` |
+| Diagnostic CSV | `xfer diag-p2p --device 0 --peer-device 1 --format csv` |
 
-Run `xfer bench --help` for filters and output options.
+Run `xfer bench --help` or `xfer diag-p2p --help` for command-specific options.
+
+`diag-p2p` runs explicit-staged calibration and repeated direct-copy phases,
+then combines throughput, compact distributions, PCIe links/topology, ACS, and
+Intel IIO counter signals. Default text is an operator summary: verdict,
+mechanism, direct versus staged bandwidth, route/link context, evidence status,
+and actionable caveats. `--details` adds raw gate messages, counter role
+summaries, and ACS bridge rows. Counter and full PCIe extended-config access may
+require:
+
+```sh
+sudo /absolute/path/to/xfer diag-p2p --device 0 --peer-device 1
+```
+
+The command never invokes or re-executes through `sudo`. Without access it
+reports the unavailable evidence and degrades to a heuristic or indeterminate
+verdict. Counter verdicts are labeled `counter-consistent`, not proven: uncore
+counters are system-wide and constrained event sets require repeated runs, so
+run diagnostics on an idle host.
 
 ## Example Result
 

@@ -1,12 +1,11 @@
 use std::io::{self, Write};
-use std::time::Duration;
 
 use crate::benchmark::{BenchEvent, Report};
 use crate::cli::OutputFormat;
-use indicatif::{ProgressBar, ProgressStyle};
 
 use super::csv::{BENCH_CSV_HEADER, render_case_csv};
 use super::model::{SystemInfo, TextOptions};
+use super::progress::{IndicatifProgress, ascii_progress_bar, clear_status, write_status};
 use super::text::{
     format_duration, render_case_text, render_summary_text, render_system_text,
     status_label_from_case_id,
@@ -21,59 +20,19 @@ pub enum StatusMode {
 
 pub struct InteractiveReporter<R> {
     inner: R,
-    progress: ProgressBar,
-    spinner_style: ProgressStyle,
-    sampling_style: ProgressStyle,
-    complete_style: ProgressStyle,
+    progress: IndicatifProgress,
 }
 
 impl<R> InteractiveReporter<R> {
     pub fn new(inner: R, color: super::model::ColorMode) -> Self {
-        let (spinner_template, sampling_template, complete_template) = match color {
-            super::model::ColorMode::Ansi => (
-                "{spinner:.cyan} {msg}",
-                "{spinner:.cyan} {msg} [{bar:20.cyan/bright_black}] {pos}/{len}",
-                "{spinner:.green} {msg}",
-            ),
-            super::model::ColorMode::Never => (
-                "{spinner} {msg}",
-                "{spinner} {msg} [{bar:20}] {pos}/{len}",
-                "{spinner} {msg}",
-            ),
-        };
-        let spinner_style = ProgressStyle::with_template(spinner_template)
-            .expect("static spinner template is valid")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
-        let sampling_style = ProgressStyle::with_template(sampling_template)
-            .expect("static sampling template is valid")
-            .progress_chars("█▉▊▋▌▍▎▏  ");
-        let complete_style = ProgressStyle::with_template(complete_template)
-            .expect("static completion template is valid")
-            .tick_strings(&["✓"]);
-        let progress = ProgressBar::new(0);
-        progress.set_style(spinner_style.clone());
-        progress.enable_steady_tick(Duration::from_millis(80));
-
         Self {
             inner,
-            progress,
-            spinner_style,
-            sampling_style,
-            complete_style,
+            progress: IndicatifProgress::new(color),
         }
     }
 
     fn spinner(&self, message: String) {
-        self.progress.reset();
-        self.progress.set_style(self.spinner_style.clone());
-        self.progress.set_message(message);
-        self.progress.enable_steady_tick(Duration::from_millis(80));
-    }
-}
-
-impl<R> Drop for InteractiveReporter<R> {
-    fn drop(&mut self) {
-        self.progress.finish_and_clear();
+        self.progress.spinner(message);
     }
 }
 
@@ -89,7 +48,7 @@ where
             _ => None,
         };
         if let Some((device_count, case_count)) = topology {
-            self.progress.finish_and_clear();
+            self.progress.clear();
             self.inner.event(event)?;
             self.spinner(topology_message(device_count, case_count));
             return Ok(());
@@ -107,37 +66,32 @@ where
                 format_duration(*duration)
             )),
             BenchEvent::SamplingStart { id, samples, .. } => {
-                self.progress.disable_steady_tick();
-                self.progress.reset();
-                self.progress.set_length(u64::from(*samples));
-                self.progress.set_position(0);
-                self.progress.set_style(self.sampling_style.clone());
-                self.progress.set_message(format!(
-                    "Benchmarking {}: Collecting",
-                    status_label_from_case_id(id.as_str())
-                ));
+                self.progress.sampling(
+                    format!(
+                        "Benchmarking {}: Collecting",
+                        status_label_from_case_id(id.as_str())
+                    ),
+                    *samples,
+                );
             }
             BenchEvent::SamplingProgress {
                 completed, total, ..
             } => {
-                self.progress.set_length(u64::from(*total));
-                self.progress.set_position(u64::from(*completed));
+                self.progress.set_position(*completed, *total);
             }
             BenchEvent::AnalysisStart { id } => self.spinner(format!(
                 "Benchmarking {}: Analyzing",
                 status_label_from_case_id(id.as_str())
             )),
             BenchEvent::CaseComplete { .. } | BenchEvent::CaseSkipped { .. } => {
-                self.progress.finish_and_clear();
+                self.progress.clear();
             }
             BenchEvent::RunComplete {
                 case_count,
                 measured_count,
                 skipped_count,
             } => {
-                self.progress.reset();
-                self.progress.set_style(self.complete_style.clone());
-                self.progress.finish_with_message(completion_message(
+                self.progress.finish_complete(completion_message(
                     *case_count,
                     *measured_count,
                     *skipped_count,
@@ -267,27 +221,13 @@ where
         if self.format == OutputFormat::Csv || !self.progress_enabled {
             return Ok(());
         }
-
-        let result = match self.status_mode {
-            StatusMode::Interactive => {
-                write!(self.stderr, "\r\u{1b}[2K{message}").and_then(|()| self.stderr.flush())
-            }
-            StatusMode::Line => {
-                writeln!(self.stderr, "{message}").and_then(|()| self.stderr.flush())
-            }
-            StatusMode::Disabled => Ok(()),
-        };
-
-        if let Err(error) = result {
-            if error.kind() == io::ErrorKind::BrokenPipe {
-                self.progress_enabled = false;
-                Ok(())
-            } else {
-                Err(error)
-            }
-        } else {
-            Ok(())
-        }
+        write_status(
+            &mut self.stderr,
+            self.status_mode,
+            &mut self.progress_enabled,
+            message,
+            false,
+        )
     }
 
     fn clear_interactive_status(&mut self) -> io::Result<()> {
@@ -298,15 +238,7 @@ where
             return Ok(());
         }
 
-        let result = write!(self.stderr, "\r\u{1b}[2K").and_then(|()| self.stderr.flush());
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                self.progress_enabled = false;
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        clear_status(&mut self.stderr, &mut self.progress_enabled)
     }
 
     fn finish_status(&mut self, message: &str) -> io::Result<()> {
@@ -314,13 +246,13 @@ where
             return Ok(());
         }
 
-        if self.status_mode == StatusMode::Interactive {
-            self.status(message)?;
-            self.stderr.write_all(b"\n")?;
-            self.stderr.flush()
-        } else {
-            self.status(message)
-        }
+        write_status(
+            &mut self.stderr,
+            self.status_mode,
+            &mut self.progress_enabled,
+            message,
+            true,
+        )
     }
 }
 
@@ -371,7 +303,7 @@ where
                 self.status(&format!(
                     "Benchmarking {}: Collecting {} {completed}/{total} samples",
                     status_label_from_case_id(id.as_str()),
-                    progress_bar(completed, total)
+                    ascii_progress_bar(completed, total)
                 ))
             }
             BenchEvent::AnalysisStart { id } => self.status(&format!(
@@ -417,16 +349,6 @@ fn completion_message(case_count: usize, measured_count: usize, skipped_count: u
 
 fn plural<'word>(count: usize, singular: &'word str, plural: &'word str) -> &'word str {
     if count == 1 { singular } else { plural }
-}
-
-fn progress_bar(completed: u32, total: u32) -> String {
-    const WIDTH: usize = 20;
-    let filled = if total == 0 {
-        0
-    } else {
-        (completed.min(total) as usize * WIDTH) / total as usize
-    };
-    format!("[{}{}]", "=".repeat(filled), " ".repeat(WIDTH - filled))
 }
 
 #[cfg(test)]

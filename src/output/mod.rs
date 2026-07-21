@@ -1,20 +1,31 @@
 //! Output model, rendering, and streaming reporting.
 
 mod csv;
+mod diagnostic_progress;
+mod diagnostics;
 mod model;
+mod progress;
 mod terminal;
 mod text;
 
 use crate::cli::OutputFormat;
 
 pub use self::csv::{BENCH_CSV_HEADER, csv_escape, render_bench_csv, render_case_csv};
+pub use self::diagnostic_progress::{DiagnosticProgressReporter, IndicatifDiagnosticProgress};
+pub use self::diagnostics::{
+    DiagnosticTextOptions, P2P_DIAGNOSTIC_CSV_HEADER, render_p2p_diagnostic_csv,
+    render_p2p_diagnostic_text, render_p2p_diagnostic_text_with_options,
+};
 pub use self::model::{
     AllocationKind, BenchCase, BenchReport, CaseOutcome, ColorMode, DeviceInfo, Endpoint, HostInfo,
     LinkInfo, ListReport, Operation, PeerAccess, PeerAccessInfo, PeerRoute, QueueFlags,
     QueueGroupInfo, QueueStreamInfo, SystemInfo, TextOptions,
 };
 pub use self::terminal::{InteractiveReporter, LiveReporter, StatusMode};
-pub use self::text::{render_bench_summary, render_bench_text, render_case_text, render_list};
+pub use self::text::{
+    format_bytes, format_duration, render_bench_summary, render_bench_text, render_case_text,
+    render_list,
+};
 
 pub fn render_bench(report: &BenchReport, format: OutputFormat, text: &TextOptions) -> String {
     match format {

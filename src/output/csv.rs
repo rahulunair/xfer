@@ -1,8 +1,9 @@
 use super::model::{
     BenchCase, BenchReport, CaseOutcome, Endpoint, LinkInfo, Operation, PeerRoute, QueueStreamInfo,
 };
+use crate::stats::DistributionShape;
 
-pub const BENCH_CSV_HEADER: &str = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_group,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason,benchmark_mode,stream_count,queue_streams,second_phase_stream_count,second_phase_queue_streams,logical_payload_bytes,submitted_copy_bytes,submission_policy,staging_barrier,peer_route_class,peer_route_detail,rate_basis,submitted_copy_median_gb_s";
+pub const BENCH_CSV_HEADER: &str = "status,transfer_class,operation,peer_access,src_device,dst_device,bytes,size,allocation,queue_group,queue_copy,queue_compute,timing_mode,warmup_ms,samples,negotiated_pcie_link,negotiated_pcie_theoretical_gb_s,median_gb_s,median_ci_lower_gb_s,median_ci_upper_gb_s,confidence_level,bootstrap_resamples,mad_gb_s,p5_gb_s,p95_gb_s,outliers_mild,outliers_severe,skip_reason,benchmark_mode,stream_count,queue_streams,second_phase_stream_count,second_phase_queue_streams,logical_payload_bytes,submitted_copy_bytes,submission_policy,staging_barrier,peer_route_class,peer_route_detail,rate_basis,submitted_copy_median_gb_s,distribution_shape";
 
 pub fn render_bench_csv(report: &BenchReport) -> String {
     let mut lines = Vec::with_capacity(report.cases.len() + 1);
@@ -90,12 +91,28 @@ pub fn render_case_csv(case: &BenchCase) -> String {
     fields.push(summary.map_or_else(String::new, |summary| {
         format_float(summary.median * f64::from(submitted_copy_multiplier(case)))
     }));
+    fields.push(summary.map_or_else(String::new, |summary| {
+        render_distribution_shape(summary.shape)
+    }));
 
     fields
         .into_iter()
         .map(|field| csv_escape(&field))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn render_distribution_shape(shape: DistributionShape) -> String {
+    match shape {
+        DistributionShape::Ordinary => "no-separated-cluster-detected".to_owned(),
+        DistributionShape::SeparatedClusters(clusters) => format!(
+            "separated-cluster-candidate:lower={:.6}/{};upper={:.6}/{}",
+            clusters.lower_center,
+            clusters.lower_count,
+            clusters.upper_center,
+            clusters.upper_count
+        ),
+    }
 }
 
 fn render_streams(streams: &[QueueStreamInfo]) -> String {
@@ -316,8 +333,8 @@ mod tests {
             .split(',')
             .collect::<Vec<_>>();
 
-        assert_eq!(columns.len(), 41);
-        assert_eq!(&columns[..base_columns.len()], base_columns);
+        assert_eq!(columns.len(), 42);
+        assert_eq!(&columns[..28], &base_columns);
         assert_eq!(columns[0], "status");
         assert_eq!(columns[1], "transfer_class");
         assert_eq!(columns[9], "queue_group");
@@ -327,6 +344,7 @@ mod tests {
         assert_eq!(columns[37], "peer_route_class");
         assert_eq!(columns[39], "rate_basis");
         assert_eq!(columns[40], "submitted_copy_median_gb_s");
+        assert_eq!(columns[41], "distribution_shape");
     }
 
     #[test]
@@ -356,7 +374,7 @@ mod tests {
             split_csv_record(lines[0]).len(),
             split_csv_record(lines[1]).len()
         );
-        assert_eq!(split_csv_record(lines[0]).len(), 41);
+        assert_eq!(split_csv_record(lines[0]).len(), 42);
         assert!(lines[1].contains("\"unknown:bad, \"\"quoted\"\" path\""));
         assert!(!csv.contains("\u{1b}["));
     }

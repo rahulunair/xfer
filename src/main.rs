@@ -2,7 +2,11 @@ use std::error::Error;
 use std::io::{self, IsTerminal, Write};
 
 use xfer::cli::{self, CliAction, Command, OutputFormat};
-use xfer::output::{self, ColorMode, InteractiveReporter, LiveReporter, StatusMode, TextOptions};
+use xfer::output::{
+    self, ColorMode, DiagnosticProgressReporter, DiagnosticTextOptions,
+    IndicatifDiagnosticProgress, InteractiveReporter, LiveReporter, StatusMode, TextOptions,
+    format_bytes,
+};
 
 fn main() {
     if let Err(error) = run() {
@@ -53,6 +57,52 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let _report = xfer::benchmark::bench_with_reporter(&options, reporter)?;
             }
         }
+        CliAction::Command(Command::DiagP2p(options)) => {
+            let stdout_is_terminal = io::stdout().is_terminal();
+            let stderr_is_terminal = io::stderr().is_terminal();
+            let mut diagnostic_options = xfer::diagnostics::P2pDiagnosticOptions::new(
+                options.device,
+                options.peer_device,
+                options.size_bytes,
+                options.samples,
+                options.warmup,
+            );
+            if let Some(queue_group) = options.queue_group {
+                diagnostic_options = diagnostic_options.with_queue_group(queue_group);
+            }
+
+            let status_mode = status_mode(options.format, stderr_is_terminal);
+            let progress_color = color_mode(options.format, stderr_is_terminal);
+            let progress_settings = diagnostic_settings(
+                options.device,
+                options.peer_device,
+                options.size_bytes,
+                options.samples,
+            );
+            let report = if status_mode == StatusMode::Interactive {
+                let reporter = IndicatifDiagnosticProgress::new(progress_color, progress_settings);
+                xfer::diagnostics::diag_p2p_with_reporter(&diagnostic_options, reporter)?
+            } else {
+                let reporter = DiagnosticProgressReporter::new(
+                    io::stderr().lock(),
+                    options.format,
+                    status_mode,
+                    progress_settings,
+                );
+                xfer::diagnostics::diag_p2p_with_reporter(&diagnostic_options, reporter)?
+            };
+            let output = match options.format {
+                OutputFormat::Text => output::render_p2p_diagnostic_text_with_options(
+                    &report,
+                    DiagnosticTextOptions {
+                        details: options.details,
+                        color: color_mode(options.format, stdout_is_terminal),
+                    },
+                ),
+                OutputFormat::Csv => output::render_p2p_diagnostic_csv(&report),
+            };
+            write_stdout(&output)?;
+        }
     }
 
     Ok(())
@@ -73,6 +123,13 @@ fn status_mode(format: OutputFormat, stderr_is_terminal: bool) -> StatusMode {
         (OutputFormat::Text, false) => StatusMode::Line,
         (OutputFormat::Csv, _) => StatusMode::Disabled,
     }
+}
+
+fn diagnostic_settings(device: u32, peer_device: u32, size_bytes: u64, samples: u32) -> String {
+    format!(
+        "dev{device} -> dev{peer_device}, {}, {samples} samples",
+        format_bytes(size_bytes)
+    )
 }
 
 fn write_stdout(output: &str) -> io::Result<()> {

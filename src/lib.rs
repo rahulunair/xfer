@@ -11,6 +11,8 @@
 pub mod benchmark;
 mod bootstrap;
 pub mod cli;
+pub mod diagnostics;
+pub mod evidence;
 pub mod histogram;
 pub mod level_zero;
 pub mod output;

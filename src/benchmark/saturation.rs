@@ -10,6 +10,7 @@ use super::command::{
 };
 use super::error::{BenchmarkError, CaseExecutionError, ze_fatal};
 use super::event::ExecutionEvent;
+use super::measurement::{MeasurementObserver, SampleContext, observe_sample, sample_context};
 use super::plan::{CasePlan, ExecutionPlan};
 use super::sampling::{estimate_collection, sample_capacity, warmup};
 use super::topology::{DeviceRecord, Topology};
@@ -112,6 +113,7 @@ pub(crate) fn measure_case(
     options: &BenchOptions,
     bytes: usize,
     events: &mut dyn FnMut(ExecutionEvent),
+    observer: &mut dyn MeasurementObserver,
 ) -> std::result::Result<Vec<Duration>, CaseExecutionError> {
     match plan.execution {
         ExecutionPlan::HostToDevice { device } => {
@@ -126,11 +128,29 @@ pub(crate) fn measure_case(
         ExecutionPlan::Direct {
             source,
             destination,
-        } => measure_direct(topology, plan, options, bytes, source, destination, events),
+        } => measure_direct(
+            topology,
+            plan,
+            options,
+            bytes,
+            source,
+            destination,
+            events,
+            observer,
+        ),
         ExecutionPlan::Staged {
             source,
             destination,
-        } => measure_staged(topology, plan, options, bytes, source, destination, events),
+        } => measure_staged(
+            topology,
+            plan,
+            options,
+            bytes,
+            source,
+            destination,
+            events,
+            observer,
+        ),
     }
 }
 
@@ -296,6 +316,7 @@ fn measure_same_device(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_direct(
     topology: &Topology,
     plan: &CasePlan,
@@ -304,6 +325,7 @@ fn measure_direct(
     source_index: usize,
     destination_index: usize,
     events: &mut dyn FnMut(ExecutionEvent),
+    observer: &mut dyn MeasurementObserver,
 ) -> std::result::Result<Vec<Duration>, CaseExecutionError> {
     let source_device = &topology.devices[source_index];
     let destination_device = &topology.devices[destination_index];
@@ -345,28 +367,35 @@ fn measure_direct(
         sample_d2d(&streams, &chunks, &destination, &source)
     })?;
     begin_sampling(options, events, warmup_result);
-    collect_samples(options, events, || {
-        fill_pattern(host.as_mut_slice(), SENTINEL_SEED);
-        copy_h2d_full(
-            &verify_stream,
-            &destination,
-            &host,
-            bytes,
-            "clear saturation direct destination",
-        )?;
-        let elapsed = sample_d2d(&streams, &chunks, &destination, &source)?;
-        copy_d2h_full(
-            &verify_stream,
-            &mut host,
-            &destination,
-            bytes,
-            "verify saturation direct destination",
-        )?;
-        verify_or_fail(host.as_slice(), PATTERN_SEED, &plan.label())?;
-        Ok(elapsed)
-    })
+    collect_observed_samples(
+        options,
+        events,
+        crate::cli::TransferClass::D2DDirect,
+        |context| {
+            fill_pattern(host.as_mut_slice(), SENTINEL_SEED);
+            copy_h2d_full(
+                &verify_stream,
+                &destination,
+                &host,
+                bytes,
+                "clear saturation direct destination",
+            )?;
+            let elapsed =
+                sample_d2d_observed(&streams, &chunks, &destination, &source, context, observer)?;
+            copy_d2h_full(
+                &verify_stream,
+                &mut host,
+                &destination,
+                bytes,
+                "verify saturation direct destination",
+            )?;
+            verify_or_fail(host.as_slice(), PATTERN_SEED, &plan.label())?;
+            Ok(elapsed)
+        },
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_staged(
     topology: &Topology,
     plan: &CasePlan,
@@ -375,6 +404,7 @@ fn measure_staged(
     source_index: usize,
     destination_index: usize,
     events: &mut dyn FnMut(ExecutionEvent),
+    observer: &mut dyn MeasurementObserver,
 ) -> std::result::Result<Vec<Duration>, CaseExecutionError> {
     let source_device = &topology.devices[source_index];
     let destination_device = &topology.devices[destination_index];
@@ -424,34 +454,41 @@ fn measure_staged(
         )
     })?;
     begin_sampling(options, events, warmup_result);
-    collect_samples(options, events, || {
-        fill_pattern(verify.as_mut_slice(), SENTINEL_SEED);
-        copy_h2d_full(
-            &destination_streams.streams[0],
-            &destination,
-            &verify,
-            bytes,
-            "clear saturation staged destination",
-        )?;
-        let elapsed = sample_staged(
-            &source_streams,
-            &source_chunks,
-            &destination_streams,
-            &destination_chunks,
-            &mut staging,
-            &source,
-            &destination,
-        )?;
-        copy_d2h_full(
-            &destination_streams.streams[0],
-            &mut verify,
-            &destination,
-            bytes,
-            "verify saturation staged destination",
-        )?;
-        verify_or_fail(verify.as_slice(), PATTERN_SEED, &plan.label())?;
-        Ok(elapsed)
-    })
+    collect_observed_samples(
+        options,
+        events,
+        crate::cli::TransferClass::D2DStaged,
+        |context| {
+            fill_pattern(verify.as_mut_slice(), SENTINEL_SEED);
+            copy_h2d_full(
+                &destination_streams.streams[0],
+                &destination,
+                &verify,
+                bytes,
+                "clear saturation staged destination",
+            )?;
+            let elapsed = sample_staged_observed(
+                &source_streams,
+                &source_chunks,
+                &destination_streams,
+                &destination_chunks,
+                &mut staging,
+                &source,
+                &destination,
+                context,
+                observer,
+            )?;
+            copy_d2h_full(
+                &destination_streams.streams[0],
+                &mut verify,
+                &destination,
+                bytes,
+                "verify saturation staged destination",
+            )?;
+            verify_or_fail(verify.as_slice(), PATTERN_SEED, &plan.label())?;
+            Ok(elapsed)
+        },
+    )
 }
 
 fn sample_h2d(
@@ -515,6 +552,23 @@ fn sample_d2d(
     )
 }
 
+fn sample_d2d_observed(
+    streams: &StreamSet<'_>,
+    chunks: &[Chunk],
+    destination: &ze::DeviceAllocation<'_>,
+    source: &ze::DeviceAllocation<'_>,
+    context: &SampleContext,
+    observer: &mut dyn MeasurementObserver,
+) -> std::result::Result<Duration, CaseExecutionError> {
+    prepare_d2d_streams(streams, chunks, destination, source)?;
+    observe_sample(observer, context, || {
+        streams.time_prepared(
+            "execute saturation D2D copies",
+            "synchronize saturation D2D copies",
+        )
+    })
+}
+
 fn prepare_d2d_streams(
     streams: &StreamSet<'_>,
     chunks: &[Chunk],
@@ -563,6 +617,39 @@ fn sample_staged(
         "synchronize saturation staged H2D copies",
     )?;
     Ok(started.elapsed())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_staged_observed(
+    source_streams: &StreamSet<'_>,
+    source_chunks: &[Chunk],
+    destination_streams: &StreamSet<'_>,
+    destination_chunks: &[Chunk],
+    staging: &mut ze::HostAllocation<'_>,
+    source: &ze::DeviceAllocation<'_>,
+    destination: &ze::DeviceAllocation<'_>,
+    context: &SampleContext,
+    observer: &mut dyn MeasurementObserver,
+) -> std::result::Result<Duration, CaseExecutionError> {
+    prepare_d2h_streams(source_streams, source_chunks, staging, source)?;
+    prepare_h2d_streams(
+        destination_streams,
+        destination_chunks,
+        destination,
+        staging,
+    )?;
+    observe_sample(observer, context, || {
+        let started = Instant::now();
+        source_streams.submit_and_sync(
+            "execute saturation staged D2H copies",
+            "synchronize saturation staged D2H copies",
+        )?;
+        destination_streams.submit_and_sync(
+            "execute saturation staged H2D copies",
+            "synchronize saturation staged H2D copies",
+        )?;
+        Ok(started.elapsed())
+    })
 }
 
 fn prepare_d2h_streams(
@@ -714,6 +801,29 @@ fn collect_samples(
     let mut durations = Vec::with_capacity(sample_capacity(options.samples)?);
     for sample_index in 0..options.samples {
         durations.push(sample()?);
+        events(ExecutionEvent::SamplingProgress {
+            completed: sample_index + 1,
+            total: options.samples,
+        });
+    }
+    Ok(durations)
+}
+
+fn collect_observed_samples(
+    options: &BenchOptions,
+    events: &mut dyn FnMut(ExecutionEvent),
+    transfer_class: crate::cli::TransferClass,
+    mut sample: impl FnMut(&SampleContext) -> std::result::Result<Duration, CaseExecutionError>,
+) -> std::result::Result<Vec<Duration>, CaseExecutionError> {
+    let mut durations = Vec::with_capacity(sample_capacity(options.samples)?);
+    for sample_index in 0..options.samples {
+        let context = sample_context(
+            transfer_class,
+            options.size_bytes,
+            sample_index,
+            options.mode,
+        );
+        durations.push(sample(&context)?);
         events(ExecutionEvent::SamplingProgress {
             completed: sample_index + 1,
             total: options.samples,

@@ -1,0 +1,7 @@
+Family-model,Version,Filename,EventType,Core Type,Native Model ID,Core Role Name
+GenuineIntel-6-8F,V1.39,/SPR/events/sapphirerapids_uncore.json,uncore,,,
+GenuineIntel-6-8F,V1.39,/SPR/events/sapphirerapids_uncore_experimental.json,uncore experimental,,,
+GenuineIntel-6-AD,V1.20,/GNR/events/graniterapids_uncore.json,uncore,,,
+GenuineIntel-6-AD,V1.20,/GNR/events/graniterapids_uncore_experimental.json,uncore experimental,,,
+GenuineIntel-6-AE,V1.20,/GNR/events/graniterapids_uncore.json,uncore,,,
+GenuineIntel-6-AE,V1.20,/GNR/events/graniterapids_uncore_experimental.json,uncore experimental,,,
