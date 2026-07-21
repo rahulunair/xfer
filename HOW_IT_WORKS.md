@@ -111,7 +111,7 @@ sample-to-sample variation and prevent robust outlier reporting.
 
 ## Statistical analysis
 
-Statistics are derived from retained sample durations:
+Retained sample durations are the primary timing data:
 
 - The center is the median duration.
 - The median confidence interval is a deterministic 95% percentile bootstrap
@@ -119,15 +119,32 @@ Statistics are derived from retained sample durations:
 - The throughput median is `bytes / median duration`.
 - Duration confidence bounds are inverted when converted to throughput because
   a longer duration means a lower rate.
-- Throughput MAD is the median absolute deviation from the throughput median.
-- p5 and p95 use Hyndman-Fan type 7 linear interpolation.
-- Quartiles use the same type 7 definition.
-- Mild outliers lie outside 1.5 interquartile ranges from Q1 or Q3.
-- Severe outliers lie outside 3 interquartile ranges.
+- Throughput MAD is the median absolute deviation of retained per-sample rates
+  from the duration-derived throughput median.
+- Throughput p5, p95, quartiles, Tukey outliers, and distribution shape are
+  computed from retained per-sample rates.
+- Percentiles use Hyndman-Fan type 7 linear interpolation.
+- Mild Tukey outliers lie outside 1.5 interquartile ranges from Q1 or Q3.
+- Severe Tukey outliers lie outside 3 interquartile ranges.
 
 Outliers are reported and retained; they are not discarded. A zero MAD means
 the samples had no median absolute variation at the available timer resolution,
 not that the measurement is exact.
+
+The separated-cluster detector is conservative. It requires at least 12 samples,
+two substantial clusters around the largest eligible gap, and several separation
+checks. Each cluster must contain at least `max(4, ceil(15% of sample count))`
+samples. The overall p5..p95 spread must be positive. The largest eligible gap
+must be at least 1.25x the next largest eligible gap, at least 12% of the
+overall p5..p95 spread, and the cluster centers must be separated by at least
+2.5x the larger within-cluster MAD.
+
+A separated-cluster result is labeled `separated-cluster candidate`. It is a
+shape warning, not route proof. Detailed benchmark output reports the lower and
+upper centers and counts and says one median is not representative; histograms
+omit the median marker. The compact `diag-p2p` report omits the overall median
+and reports lower and upper centers, p10..p90 ranges, and counts. Median-based
+transport heuristics are disabled for separated throughput clusters.
 
 ## Timing modes
 
@@ -215,19 +232,27 @@ caveats. `--details` reveals raw gate messages, counter role summaries, and ACS
 bridge rows. CSV keeps a stable machine-readable summary, including every ACS
 bridge outcome and path, for scripts.
 
-A peer counter signal is not enough by itself. A `counter-consistent-peer`
-verdict also requires calibrated direct-memory events with valid repeats whose
-p90 remains within the idle baseline plus 5% of expected transfer traffic.
-Unavailable direct-memory evidence therefore cannot be mistaken for evidence
-that host traffic was absent.
+A peer counter signal is not enough by itself. In conceptual terms, a
+counter-consistent peer verdict also requires calibrated direct-memory evidence
+with valid repeats. The direct-memory idle baseline p95 must be no more than 5%
+of expected transfer traffic, and the direct-memory sample p90 must remain
+within that idle baseline plus another 5% of expected transfer traffic.
+Unavailable or noisy direct-memory evidence therefore cannot be mistaken for
+evidence that host traffic was absent.
 
-The Linux uncore counters are system-wide rather than transaction-tagged to a
-Level Zero device pair. Hardware counter restrictions also require separate
-repeated passes for memory and peer event sets. For those reasons the strongest
-labels are `counter-consistent-peer`,
-`counter-consistent-host-memory-traffic`, and
-`mixed-signals-across-repeated-runs`, not route proof. Run the command while
-other GPU and high-volume I/O activity is idle.
+The Linux uncore counters are useful because they observe memory and peer event
+classes outside the Level Zero API path, but they are system-wide rather than
+transaction-tagged to a Level Zero device pair. Hardware counter restrictions
+also require separate repeated passes for memory and peer event sets. For those
+reasons the exact human verdict labels are `counter-consistent peer traffic`,
+`counter-consistent peer traffic (upstream-routed)`,
+`counter-consistent host-memory traffic`, `mixed signals across repeated runs`,
+`mixed counter signals; ACS redirect policy enabled`, heuristic-only variants,
+or `indeterminate`, not route proof. CSV uses
+`counter-consistent-peer`, `counter-consistent-host-memory-traffic`,
+`mixed-signals-across-repeated-runs`, `heuristic-only:*`, or
+`indeterminate`. Run the command while other GPU and high-volume I/O activity is
+idle.
 
 The compiled-in profiles cover Intel SPR-X model `0x8f`, GNR-X model `0xad`,
 and GNR-D model `0xae`. Events and map rows are minimal extracts from
@@ -252,18 +277,29 @@ not treated as a loader repair mechanism.
 ## Comparison with ze_peer
 
 Intel's `ze_peer` is useful reference code, but an equivalent comparison
-requires matching the operation rather than comparing two labels.
+requires matching the operation rather than comparing two labels. The comparison
+notes here are pinned to `oneapi-src/level-zero-tests` commit
+`0c3f65e9f903c5765cb21e8713eb1526f6d3e04e`.
 
-The local Level Zero Tests implementation inspected for this design enumerates
-every `(queue-group ID, queue index)` pair and presents a flattened `-u`
-"engine" number. Its default flattened index 0 maps to group 0, queue 0.
-Its `--parallel_single_target` path divides one total buffer among selected
-flattened queue entries, submits the selected command lists, then synchronizes
-them. That payload interpretation aligns with `xfer --saturation`.
+At that commit, `ze_peer -q` enumerates every `(queue-group ID, queue index)`
+pair and presents a flattened `-u` "engine" number. The flattened number
+increments across groups and across queue indices within each group: if group 0
+has queues 0 and 1 and group 1 has queue 0, the corresponding `-u` values are
+0, 1, and 2. Its default flattened index 0 maps to group 0, queue 0. Use the
+exact build's `-q` output and selected `-u` values when translating a
+comparison.
+
+Current upstream defaults to immediate command lists, and `--regular_cmdlist`
+opts into regular command lists. The pinned `--parallel_single_target` path
+divides one total buffer among selected flattened queue entries, submits the
+selected command lists, then synchronizes them. That payload interpretation
+aligns with `xfer --saturation`.
 
 The defaults are not equivalent: `xfer` saturation selects groups advertising
-copy capability, while `ze_peer` documents compute-capable entries as its
-parallel default. Select and map queues explicitly for a comparison.
+copy capability, while `ze_peer` help describes some parallel defaults as using
+engines with compute capability. Treat that help wording as option guidance,
+not a substitute for the exact build's `-q`/`-u` mapping. Select and map queues
+explicitly for a comparison.
 
 Important differences remain:
 
@@ -272,8 +308,9 @@ Important differences remain:
   reports robust summaries and a confidence interval.
 - `ze_peer` warm-up defaults to an iteration count. `xfer` warm-up is
   duration-based.
-- `ze_peer` can use immediate command lists and several bidirectional or
-  multi-target modes that are not the same operation as `xfer` saturation.
+- `ze_peer` uses immediate command lists by default, supports regular command
+  lists with `--regular_cmdlist`, and has several bidirectional or multi-target
+  modes that are not the same operation as `xfer` saturation.
 - `xfer` poisons and verifies every measured destination. `ze_peer` validation
   behavior depends on its options and path.
 
